@@ -1,4 +1,4 @@
-# Database Opgave — Step-by-Step Guide & Learnings
+3# Database Opgave — Step-by-Step Guide & Learnings
 
 This guide walks through every task from your database assignment emails in chronological order. Because the assignment states **"Use T-SQL in solutions unless otherwise stated"** and **"Some of the tasks will intentionally give you errors"**, each step below includes:
 1. **How to do it** (T-SQL scripts and/or GUI steps)
@@ -196,7 +196,7 @@ USE [master];
 GO
 
 -- 1. Change Recovery Model from SIMPLE to FULL
-ALTER DATABASE [AdventureWorksLT2022]
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = N'AdventureWorksLT2022' AND state_desc = N'ONLINE') ALTER DATABASE [AdventureWorksLT2022]
 SET RECOVERY FULL;
 GO
 
@@ -349,7 +349,7 @@ USE [master];
 GO
 
 -- Kick out any active connections so we can overwrite the database
-ALTER DATABASE [AdventureWorksLT2022]
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = N'AdventureWorksLT2022' AND state_desc = N'ONLINE') ALTER DATABASE [AdventureWorksLT2022]
 SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
 GO
 
@@ -361,25 +361,25 @@ GO
 
 -- 2. Restore the initial test .trn file from Step 1.7 WITH NORECOVERY
 RESTORE LOG [AdventureWorksLT2022]
-FROM DISK = N'C:\Exo\Database\AdventureWorksLT2022_Log_20261111_142800.trn'
+FROM DISK = N'C:\Exo\Database\AdventureWorksLT2022_Log_20261111_102714.trn'
 WITH NORECOVERY;
 GO
 
 -- 3. Restore the .trn file taken after TableA WITH NORECOVERY
 RESTORE LOG [AdventureWorksLT2022]
-FROM DISK = N'C:\Exo\Database\AdventureWorksLT2022_Log_20261111_143010.trn'
+FROM DISK = N'C:\Exo\Database\AdventureWorksLT2022_Log_20261111_103703.trn'
 WITH NORECOVERY;
 GO
 
 -- 4. Restore the final .trn file (which contains TableB) WITH STOPAT and RECOVERY!
 RESTORE LOG [AdventureWorksLT2022]
-FROM DISK = N'C:\Exo\Database\AdventureWorksLT2022_Log_20261111_143115.trn'
-WITH STOPAT = N'2026-11-11 14:30:30.000', -- Timestamp between TableA and TableB
+FROM DISK = N'C:\Exo\Database\AdventureWorksLT2022_Log_20261111_103851.trn'
+WITH STOPAT = N'2026-11-11 10:37:30.000', -- Timestamp between TableA and TableB
      RECOVERY;
 GO
 
 -- Bring database back to MULTI_USER mode
-ALTER DATABASE [AdventureWorksLT2022]
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = N'AdventureWorksLT2022' AND state_desc = N'ONLINE') ALTER DATABASE [AdventureWorksLT2022]
 SET MULTI_USER;
 GO
 
@@ -491,7 +491,7 @@ SET NOCOUNT ON;
 DECLARE @DatabaseName   SYSNAME       = N''AdventureWorksLT2022'';
 DECLARE @BackupFolder   NVARCHAR(260) = N''C:\Exo\Database'';
 DECLARE @FullBackupFile NVARCHAR(500) = N''C:\Exo\Database\AdventureWorksLT2022_Full.bak'';
-DECLARE @StopAt         DATETIME      = ''2026-11-11 14:30:30.000'';
+DECLARE @StopAt         DATETIME      = ''2026-11-11 10:37:30.000'';
 
 -- ============================================================================
 -- STEP 1: Read Full Backup Header to find its LastLSN
@@ -529,7 +529,7 @@ TRUNCATE TABLE #BackupHeader;
 -- ============================================================================
 -- STEP 2: Kick users off and Restore the Full Backup WITH NORECOVERY
 -- ============================================================================
-IF DB_ID(@DatabaseName) IS NOT NULL
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = @DatabaseName AND state_desc = N''ONLINE'')
 BEGIN
     SET @Sql = N''ALTER DATABASE '' + QUOTENAME(@DatabaseName) + N'' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;'';
     EXEC (@Sql);
