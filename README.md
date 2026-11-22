@@ -764,3 +764,1102 @@ When `DBCC CHECKDB` finds corruption, its output will state the **minimum repair
      DBCC CHECKDB (N'CorruptDB', REPAIR_ALLOW_DATA_LOSS) WITH NO_INFOMSGS, ALL_ERRORMSGS;
      ALTER DATABASE [CorruptDB] SET MULTI_USER;
      ```
+
+---
+
+## Part 5: `MS SQL Server DatabaseMail Configuration` (Prerequisites)
+
+Before SQL Server Agent jobs can send email alerts in Part 6, you need a working local SMTP server and Database Mail configured on your SQL Server instance.
+
+### Step 5.1 — Install Papercut SMTP, Configure Firewall & Verify in PowerShell
+**Task:**
+1. Install a local SMTP server (**Papercut SMTP**).
+2. On the Windows Firewall prompt, **only allow Private networks** for Papercut SMTP.
+3. Verify SMTP mail delivery using PowerShell (`Send-MailMessage`).
+
+#### How to do it
+1. **Download and install Papercut SMTP:**
+   - Website: `https://www.papercut-smtp.com/`
+   - Direct installer: `https://github.com/ChangemakerStudios/Papercut-SMTP/releases/latest/download/PapercutSMTP-win-x64-stable-Setup.exe`
+   ```powershell
+   Invoke-WebRequest -Uri "https://github.com/ChangemakerStudios/Papercut-SMTP/releases/latest/download/PapercutSMTP-win-x64-stable-Setup.exe" -OutFile "$env:TEMP\PapercutSMTP-Setup.exe"
+   Start-Process "$env:TEMP\PapercutSMTP-Setup.exe" -Wait
+   ```
+2. **Launch Papercut SMTP & Configure Windows Firewall:**
+   - When Windows Defender Firewall prompts on first launch:
+     - **Check** `Private networks, such as my home or work network`
+     - **Uncheck** `Public networks, such as those in airports and coffee shops`
+   - Confirm Papercut is listening on `127.0.0.1:25` (default).
+3. **Verify SMTP functionality in PowerShell:**
+   ```powershell
+   Send-MailMessage -SmtpServer localhost -Port 25 -From "test@localhost.localdomain" -To "anyone@anywhere.example" -Subject "Hello from Papercut!" -Body "SMTP works!"
+   ```
+   Open the **Papercut SMTP** window and confirm `"Hello from Papercut!"` appears in the inbox.
+
+#### What it achieves
+Provides a safe, zero-cost local SMTP sink on port `25` that catches every email sent by PowerShell and SQL Server Database Mail without needing external internet relay credentials or spamming real inboxes.
+
+#### Key Learnings
+- Restricting Papercut to **Private networks** prevents machines on untrusted Public networks (e.g., café/guest Wi-Fi) from connecting to your local port `25` SMTP listener.
+- PowerShell's `Send-MailMessage` is marked obsolete in newer .NET versions (and emits a warning), which is harmless for a quick lab test, though production scripts should use `MailKit` or authenticated REST APIs.
+
+---
+
+### Step 5.2 — Configure SQL Server Database Mail & SQL Agent Mail (T-SQL)
+**Task:** Configure SQL Server Database Mail and link it to SQL Server Agent so jobs and T-SQL scripts can send HTML notifications through Papercut SMTP.
+
+#### How to do it
+```sql
+USE [master];
+GO
+
+-- 1. Enable Database Mail Extended Stored Procedures
+EXEC sp_configure N'show advanced options', 1;
+RECONFIGURE;
+EXEC sp_configure N'Database Mail XPs', 1;
+RECONFIGURE;
+GO
+
+USE [msdb];
+GO
+
+-- 2. Create a Database Mail Profile
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile WHERE name = N'DBA_Notifications')
+BEGIN
+    EXEC msdb.dbo.sysmail_add_profile_sp
+        @profile_name = N'DBA_Notifications',
+        @description  = N'Profile for SQL Server DBA alerts and notifications via local Papercut SMTP.';
+END
+GO
+
+-- 3. Create a Database Mail Account pointing to local Papercut SMTP (localhost:25)
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_account WHERE name = N'Local_Papercut_SMTP')
+BEGIN
+    EXEC msdb.dbo.sysmail_add_account_sp
+        @account_name    = N'Local_Papercut_SMTP',
+        @description     = N'Local Papercut SMTP relay on port 25.',
+        @email_address   = N'sqlserver@localhost.localdomain',
+        @display_name    = N'SQL Server Alerting (EXO)',
+        @replyto_address = N'dba@localhost.localdomain',
+        @mailserver_name = N'127.0.0.1',
+        @port            = 25,
+        @enable_ssl      = 0;
+END
+GO
+
+-- 4. Link the Account to the Profile (sequence_number = 1)
+IF NOT EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysmail_profileaccount pa
+    JOIN msdb.dbo.sysmail_profile p ON pa.profile_id = p.profile_id
+    JOIN msdb.dbo.sysmail_account a ON pa.account_id = a.account_id
+    WHERE p.name = N'DBA_Notifications' AND a.name = N'Local_Papercut_SMTP'
+)
+BEGIN
+    EXEC msdb.dbo.sysmail_add_profileaccount_sp
+        @profile_name    = N'DBA_Notifications',
+        @account_name    = N'Local_Papercut_SMTP',
+        @sequence_number = 1;
+END
+GO
+
+-- 5. Grant public access & set as the default Database Mail profile
+IF NOT EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysmail_principalprofile pp
+    JOIN msdb.dbo.sysmail_profile p ON pp.profile_id = p.profile_id
+    WHERE p.name = N'DBA_Notifications' AND pp.principal_sid = 0x00
+)
+BEGIN
+    EXEC msdb.dbo.sysmail_add_principalprofile_sp
+        @profile_name   = N'DBA_Notifications',
+        @principal_name = N'public',
+        @is_default     = 1;
+END
+GO
+
+-- 6. Configure SQL Server Agent to use Database Mail & create a DBA Operator
+EXEC msdb.dbo.sp_set_sqlagent_properties
+    @email_save_in_sent_folder = 1,
+    @databasemail_profile      = N'DBA_Notifications',
+    @use_databasemail          = 1;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysoperators WHERE name = N'DBA_Admin')
+BEGIN
+    EXEC msdb.dbo.sp_add_operator
+        @name          = N'DBA_Admin',
+        @enabled       = 1,
+        @email_address = N'dba@anywhere.example';
+END
+GO
+
+-- 7. Test Database Mail with a formatted HTML email
+EXEC msdb.dbo.sp_send_dbmail
+    @profile_name = N'DBA_Notifications',
+    @recipients   = N'dba@anywhere.example',
+    @subject      = N'SQL Server Database Mail Test',
+    @body         = N'<h3>Database Mail is working!</h3><p>Sent from <b>SQL Server</b> to Papercut SMTP.</p>',
+    @body_format  = N'HTML';
+GO
+
+-- 8. Verify delivery status in msdb (wait a few seconds for Service Broker queue)
+WAITFOR DELAY '00:00:05';
+SELECT mailitem_id, recipients, subject, sent_status, sent_date
+FROM msdb.dbo.sysmail_allitems
+ORDER BY mailitem_id DESC;
+
+SELECT TOP (10) log_date, event_type, description
+FROM msdb.dbo.sysmail_event_log
+ORDER BY log_id DESC;
+GO
+```
+
+*(Note: After setting `@use_databasemail = 1` on SQL Server Agent, **restart the SQL Server Agent service** — `SQLAgent$EXO` on `EXOPI-908\EXO` — e.g. `Restart-Service 'SQLAgent$EXO'` in an elevated PowerShell window or via SSMS/Configuration Manager, so Agent picks up the new mail profile for job-level notifications.)*
+
+#### What it achieves
+Enables SQL Server's asynchronous Service Broker-backed mail subsystem (`DatabaseMail.exe`) and registers `DBA_Notifications` as the default mail profile for `sp_send_dbmail` and SQL Server Agent.
+
+#### Key Learnings & Traps
+- **Trap 1 (`Database Mail XPs` disabled by default):** SQL Server disables Database Mail out of the box for attack-surface reduction. Calling `sp_send_dbmail` before enabling `Database Mail XPs` raises Msg 15281 (*"SQL Server blocked access to procedure 'dbo.sp_send_dbmail'..."*).
+- **Trap 2 (Asynchronous Delivery):** `sp_send_dbmail` returns immediately (`Mail (Id: 1) queued.`) even if SMTP is down! Always inspect `msdb.dbo.sysmail_allitems` (`sent_status`: `sent`, `unsent`, `retrying`, `failed`) and `msdb.dbo.sysmail_event_log` when troubleshooting.
+- **Trap 3 (`127.0.0.1` vs `localhost`):** Using `127.0.0.1` avoids IPv6 `::1` resolution mismatches if Papercut is only bound to IPv4 loopback.
+
+---
+
+## Part 6: `DatabaseMail.Notification` — Integrity Alerts, DDL Auditing & Impersonation
+
+### Step 6.1 — Create & Test SQL Agent Job `CheckDB`
+**Task:**
+1. Create a SQL Agent job named **`CheckDB`**.
+2. Run integrity checks (`DBCC CHECKDB`) across **all user and system databases**.
+3. Get notified by an **HTML/CSS table-formatted email** if `CheckDB` finds any kind of corruption.
+4. Test the solution.
+
+#### How to do it
+The key to sending a rich HTML table *only when corruption is found* is `DBCC CHECKDB (...) WITH NO_INFOMSGS, ALL_ERRORMSGS, TABLERESULTS`.
+- When a database is **healthy**, `WITH NO_INFOMSGS, TABLERESULTS` returns **0 rows**.
+- When **corruption exists**, it returns structured rows (`Error`, `Level`, `State`, `MessageText`, `RepairLevel`, `File`, `Page`, `Slot`, etc.) that we collect into a temp table across every `ONLINE` database and render as an HTML `<table>`.
+- Wrapping each database check in `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH` ensures severe metadata/snapshot errors are also captured and emailed rather than aborting the loop prematurely.
+
+```sql
+USE [msdb];
+GO
+
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'CheckDB')
+    EXEC msdb.dbo.sp_delete_job @job_name = N'CheckDB', @delete_unused_schedule = 1;
+GO
+
+EXEC dbo.sp_add_job
+    @job_name    = N'CheckDB',
+    @enabled     = 1,
+    @description = N'Runs DBCC CHECKDB on all online system and user databases and sends an HTML/CSS email if corruption is detected.';
+GO
+
+EXEC dbo.sp_add_jobstep
+    @job_name      = N'CheckDB',
+    @step_name     = N'Run DBCC CHECKDB and Notify on Corruption',
+    @subsystem     = N'TSQL',
+    @database_name = N'master',
+    @command       = N'
+SET NOCOUNT ON;
+
+IF OBJECT_ID(N''tempdb..#CheckDBResults'') IS NOT NULL DROP TABLE #CheckDBResults;
+CREATE TABLE #CheckDBResults (
+    Error        INT,
+    [Level]      INT,
+    [State]      INT,
+    MessageText  NVARCHAR(4000),
+    RepairLevel  NVARCHAR(128),
+    [Status]     INT,
+    [DbId]       INT,
+    DbFragId     INT,
+    ObjectId     INT,
+    IndexId      INT,
+    PartitionId  BIGINT,
+    AllocUnitId  BIGINT,
+    RidDbId      INT,
+    RidPruId     INT,
+    [File]       INT,
+    [Page]       INT,
+    Slot         INT,
+    RefDbId      INT,
+    RefPruId     INT,
+    RefFile      INT,
+    RefPage      INT,
+    RefSlot      INT,
+    Allocation   INT
+);
+
+IF OBJECT_ID(N''tempdb..#AllCorruption'') IS NOT NULL DROP TABLE #AllCorruption;
+CREATE TABLE #AllCorruption (
+    DatabaseName SYSNAME,
+    Error        INT,
+    [Level]      INT,
+    [State]      INT,
+    RepairLevel  NVARCHAR(128),
+    FilePage     NVARCHAR(50),
+    MessageText  NVARCHAR(4000)
+);
+
+DECLARE @DbName SYSNAME;
+DECLARE @Sql    NVARCHAR(MAX);
+
+DECLARE DbCursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name
+    FROM sys.databases
+    WHERE state_desc = N''ONLINE''
+      AND source_database_id IS NULL -- exclude database snapshots
+    ORDER BY database_id;
+
+OPEN DbCursor;
+FETCH NEXT FROM DbCursor INTO @DbName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    TRUNCATE TABLE #CheckDBResults;
+
+    BEGIN TRY
+        SET @Sql = N''DBCC CHECKDB ('' + QUOTENAME(@DbName) + N'') WITH NO_INFOMSGS, ALL_ERRORMSGS, TABLERESULTS;'';
+
+        INSERT INTO #CheckDBResults
+        EXEC (@Sql);
+
+        -- Keep actual error/corruption rows (Level >= 11 or Error > 0)
+        INSERT INTO #AllCorruption (DatabaseName, Error, [Level], [State], RepairLevel, FilePage, MessageText)
+        SELECT
+            @DbName,
+            Error,
+            [Level],
+            [State],
+            ISNULL(RepairLevel, N''N/A''),
+            CASE
+                WHEN [File] IS NOT NULL AND [Page] IS NOT NULL
+                THEN CONCAT([File], N'':'', [Page])
+                ELSE N''-''
+            END,
+            MessageText
+        FROM #CheckDBResults
+        WHERE [Level] >= 11 OR MessageText LIKE N''%corrupt%'' OR MessageText LIKE N''%consistency error%'';
+    END TRY
+    BEGIN CATCH
+        INSERT INTO #AllCorruption (DatabaseName, Error, [Level], [State], RepairLevel, FilePage, MessageText)
+        VALUES (
+            @DbName,
+            ERROR_NUMBER(),
+            ERROR_SEVERITY(),
+            ERROR_STATE(),
+            N''Check Failed'',
+            N''-'',
+            ERROR_MESSAGE()
+        );
+    END CATCH
+
+    FETCH NEXT FROM DbCursor INTO @DbName;
+END
+
+CLOSE DbCursor;
+DEALLOCATE DbCursor;
+
+-- Send HTML/CSS email ONLY if corruption or check errors were found
+IF EXISTS (SELECT 1 FROM #AllCorruption)
+BEGIN
+    DECLARE @TableRows NVARCHAR(MAX);
+    DECLARE @HtmlBody  NVARCHAR(MAX);
+    DECLARE @Subject   NVARCHAR(255) = N''[CRITICAL] DBCC CHECKDB Corruption Detected on '' + @@SERVERNAME;
+
+    SELECT @TableRows = (
+        SELECT
+            td = DatabaseName,                                    N'''',
+            td = CAST(Error AS NVARCHAR(20)),                     N'''',
+            td = CAST([Level] AS NVARCHAR(20)),                   N'''',
+            td = FilePage,                                        N'''',
+            td = RepairLevel,                                     N'''',
+            td = MessageText
+        FROM #AllCorruption
+        ORDER BY DatabaseName, [Level] DESC, Error
+        FOR XML PATH(''tr''), TYPE
+    ).value(''.'', ''NVARCHAR(MAX)'');
+
+    SET @HtmlBody = N''
+    <html>
+    <head>
+        <style>
+            body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; background-color: #f9fafb; margin: 0; padding: 20px; }
+            .card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; max-width: 960px; }
+            h2 { color: #b91c1c; margin-top: 0; }
+            .meta { font-size: 13px; color: #4b5563; margin-bottom: 16px; }
+            table { border-collapse: collapse; width: 100%; font-size: 13px; }
+            th { background-color: #991b1b; color: #ffffff; text-align: left; padding: 10px 12px; border: 1px solid #7f1d1d; }
+            td { padding: 8px 12px; border: 1px solid #e5e7eb; vertical-align: top; }
+            tr:nth-child(even) td { background-color: #fef2f2; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>DBCC CHECKDB Corruption Alert</h2>
+            <div class="meta">
+                <strong>Server:</strong> '' + @@SERVERNAME + N'' &nbsp;|&nbsp;
+                <strong>Detected At:</strong> '' + CONVERT(NVARCHAR(30), SYSDATETIME(), 120) + N''
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Database</th>
+                        <th>Error</th>
+                        <th>Severity</th>
+                        <th>File:Page</th>
+                        <th>Min Repair Level</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody>'' + ISNULL(@TableRows, N'''') + N''</tbody>
+            </table>
+        </div>
+    </body>
+    </html>'';
+
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = N'DBA_Notifications',
+        @recipients   = N'dba@anywhere.example',
+        @subject      = @Subject,
+        @body         = @HtmlBody,
+        @body_format  = N'HTML',
+        @importance   = N'HIGH';
+END
+';
+GO
+
+EXEC dbo.sp_add_jobserver
+    @job_name    = N'CheckDB',
+    @server_name = N'(local)';
+GO
+```
+
+#### Testing the `CheckDB` Job
+1. **Baseline clean run:**
+   ```sql
+   EXEC msdb.dbo.sp_start_job @job_name = N'CheckDB';
+   ```
+   Verify in `msdb.dbo.sysjobhistory` that the job succeeds and **no email** is sent when all databases are healthy.
+2. **Test corruption detection safely in a disposable database:**
+   *(Warning: **Never** run `DBCC WRITEPAGE` on a real database—only on a brand-new disposable test database `CorruptTestDB`, or restore a sample corrupt `.bak` from Part 7!)*
+   ```sql
+   USE [master];
+   GO
+   CREATE DATABASE [CorruptTestDB];
+   GO
+   USE [CorruptTestDB];
+   GO
+   CREATE TABLE dbo.TestData (ID INT IDENTITY(1,1) PRIMARY KEY, Payload CHAR(2000) DEFAULT 'A');
+   INSERT INTO dbo.TestData DEFAULT VALUES;
+   GO 10
+
+   -- Find the first data page (PageType = 1) of dbo.TestData
+   DECLARE @FileId INT, @PageId INT;
+   SELECT TOP (1) @FileId = allocated_page_file_id, @PageId = allocated_page_page_id
+   FROM sys.dm_db_database_page_allocations(DB_ID(N'CorruptTestDB'), OBJECT_ID(N'dbo.TestData'), NULL, NULL, N'DETAILED')
+   WHERE page_type = 1 AND is_allocated = 1;
+
+   -- Intentionally corrupt 4 bytes inside the page header/slot in SINGLE_USER lab mode
+   ALTER DATABASE [CorruptTestDB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+   DBCC WRITEPAGE (N'CorruptTestDB', @FileId, @PageId, 0, 4, 0xFFFFFFFF, 1);
+   ALTER DATABASE [CorruptTestDB] SET MULTI_USER;
+   GO
+
+   -- Run the CheckDB SQL Agent job and watch Papercut SMTP!
+   EXEC msdb.dbo.sp_start_job @job_name = N'CheckDB';
+   GO
+   ```
+   Check **Papercut SMTP**: you should receive `[CRITICAL] DBCC CHECKDB Corruption Detected` with a styled HTML table showing `CorruptTestDB`, the exact `File:Page`, `Min Repair Level`, and error message.
+3. **Clean up the test database afterwards:**
+   ```sql
+   USE [master];
+   GO
+   IF DB_ID(N'CorruptTestDB') IS NOT NULL
+   BEGIN
+       ALTER DATABASE [CorruptTestDB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+       DROP DATABASE [CorruptTestDB];
+   END
+   GO
+   ```
+
+#### What it achieves
+Continuously protects every system (`master`, `model`, `msdb`, `tempdb`) and user database by automating integrity verification and immediately alerting the DBA with actionable page/repair metadata.
+
+#### Key Learnings & Traps
+- **Trap 1 (`TABLERESULTS` Schema):** `DBCC CHECKDB ... WITH TABLERESULTS` has 23 columns in modern SQL Server versions; your `#CheckDBResults` temp table must match all 23 columns exactly or `INSERT INTO ... EXEC` will fail with a column-count mismatch.
+- **Trap 2 (`tempdb` Snapshot Limitation):** `DBCC CHECKDB (N'tempdb')` cannot create an internal database snapshot, so SQL Server runs `CHECKALLOC` and `CHECKCATALOG` directly and skips snapshot-based checks.
+- **Trap 3 (XML-Encoding Safety):** Building HTML rows via `FOR XML PATH('tr'), TYPE` automatically escapes `<`, `>`, and `&` inside error messages so malformed text never breaks your HTML table.
+
+---
+
+### Step 6.2 — Create SQL Agent Job `DatabaseDML` (Database & User Create/Delete Alerts)
+**Task:**
+1. Create a SQL Agent job named **`DatabaseDML`** with two steps:
+   - **Step 1:** Get notified by email when a **database** is created or deleted and **who performed the operation**.
+   - **Step 2:** Get notified by email when a **database user** is created or deleted and **who performed the operation**.
+2. Format emails cleanly using **HTML and CSS tables** (rows and columns).
+
+> [!NOTE]
+> **Terminology Note (`DatabaseDML` vs. DDL):** Even though the assignment names the job `DatabaseDML`, `CREATE DATABASE`, `DROP DATABASE`, `CREATE USER`, and `DROP USER` are actually **DDL (Data Definition Language)** / **DCL** operations—not DML (`INSERT`, `UPDATE`, `DELETE`).
+
+#### How to do it
+SQL Server's **Default Trace** (`sys.fn_trace_gettable`) is enabled out of the box and automatically records:
+- **Database Create / Delete:** `EventClass IN (46, 47)` (`Object:Created` / `Object:Deleted`) where `ObjectType = 16964` (`Database`) and `EventSubClass = 1` (`Commit`).
+- **Database User Create / Delete:** `EventClass = 109` (`Audit Add DB User Event`) where `EventSubClass IN (1, 2, 3, 4)` (`1 = Add`, `2 = Drop`, `3 = Grant DB Access`, `4 = Revoke DB Access`).
+- **Impersonation Tracking (`LoginName` vs. `SessionLoginName`):** Crucially, the Default Trace logs **both** `LoginName` (the effective/impersonated identity, e.g., `John`) **and** `SessionLoginName` (the real authenticated login that opened the connection and ran `EXECUTE AS`).
+
+First, create a small watermark table in `msdb` so each job step only emails **new** events since the previous run (avoiding duplicate emails):
+
+```sql
+USE [msdb];
+GO
+
+IF OBJECT_ID(N'dbo.DBA_TraceWatermark', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DBA_TraceWatermark (
+        CheckKey      VARCHAR(50) NOT NULL PRIMARY KEY,
+        LastEventTime DATETIME2(3) NOT NULL
+    );
+
+    -- Initialize watermarks to current time (or slightly in the past to catch immediate tests)
+    INSERT INTO dbo.DBA_TraceWatermark (CheckKey, LastEventTime)
+    VALUES ('DATABASE_DDL', DATEADD(MINUTE, -5, GETDATE())),
+           ('DBUSER_DDL',   DATEADD(MINUTE, -5, GETDATE()));
+END
+GO
+```
+
+Now create the **`DatabaseDML`** SQL Agent job with **Step 1** (Database Create/Delete) and **Step 2** (Database User Create/Delete):
+
+```sql
+USE [msdb];
+GO
+
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'DatabaseDML')
+    EXEC msdb.dbo.sp_delete_job @job_name = N'DatabaseDML', @delete_unused_schedule = 1;
+GO
+
+EXEC dbo.sp_add_job
+    @job_name    = N'DatabaseDML',
+    @enabled     = 1,
+    @description = N'Monitors Default Trace for Database and Database User Create/Delete events and sends styled HTML table alerts.';
+GO
+
+-- ============================================================================
+-- STEP 1: Notify when a Database is created or deleted (and who did it)
+-- ============================================================================
+EXEC dbo.sp_add_jobstep
+    @job_name          = N'DatabaseDML',
+    @step_name         = N'Notify Database Create or Delete',
+    @step_id           = 1,
+    @subsystem         = N'TSQL',
+    @database_name     = N'msdb',
+    @on_success_action = 3, -- Go to next step
+    @on_fail_action    = 3, -- Continue to Step 2 even if Step 1 fails
+    @command           = N'
+SET NOCOUNT ON;
+
+DECLARE @TracePath NVARCHAR(260);
+SELECT @TracePath = [path] FROM sys.traces WHERE is_default = 1;
+
+IF @TracePath IS NULL RETURN;
+
+DECLARE @LastChecked DATETIME2(3);
+SELECT @LastChecked = LastEventTime
+FROM msdb.dbo.DBA_TraceWatermark
+WHERE CheckKey = ''DATABASE_DDL'';
+
+IF OBJECT_ID(N''tempdb..#DbEvents'') IS NOT NULL DROP TABLE #DbEvents;
+
+SELECT
+    CASE t.EventClass
+        WHEN 46 THEN N''CREATED''
+        WHEN 47 THEN N''DELETED''
+    END AS Operation,
+    t.DatabaseName,
+    t.LoginName        AS EffectiveLogin,
+    t.SessionLoginName AS OriginalLogin,
+    ISNULL(t.HostName, N''-'')        AS HostName,
+    ISNULL(t.ApplicationName, N''-'') AS ApplicationName,
+    t.StartTime
+INTO #DbEvents
+FROM sys.fn_trace_gettable(@TracePath, DEFAULT) t
+WHERE t.EventClass IN (46, 47)   -- 46 = Object:Created, 47 = Object:Deleted
+  AND t.ObjectType = 16964       -- 16964 = Database
+  AND t.EventSubClass = 1        -- 1 = Commit (avoids duplicate Begin/Commit rows)
+  AND t.DatabaseName <> N''tempdb''
+  AND t.StartTime > @LastChecked;
+
+IF EXISTS (SELECT 1 FROM #DbEvents)
+BEGIN
+    DECLARE @TableRows NVARCHAR(MAX);
+    DECLARE @HtmlBody  NVARCHAR(MAX);
+    DECLARE @Subject   NVARCHAR(255) = N''[SQL Audit] Database Create/Delete Detected on '' + @@SERVERNAME;
+
+    SELECT @TableRows = (
+        SELECT
+            td = Operation,                                       N'''',
+            td = DatabaseName,                                    N'''',
+            td = EffectiveLogin,                                  N'''',
+            td = OriginalLogin,                                   N'''',
+            td = HostName,                                        N'''',
+            td = ApplicationName,                                 N'''',
+            td = CONVERT(NVARCHAR(23), StartTime, 121)
+        FROM #DbEvents
+        ORDER BY StartTime ASC
+        FOR XML PATH(''tr''), TYPE
+    ).value(''.'', ''NVARCHAR(MAX)'');
+
+    SET @HtmlBody = N''
+    <html>
+    <head>
+        <style>
+            body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; background-color: #f3f4f6; margin: 0; padding: 20px; }
+            .card { background: #ffffff; border: 1px solid #d1d5db; border-radius: 8px; padding: 20px; max-width: 1000px; }
+            h2 { color: #1d4ed8; margin-top: 0; }
+            p.sub { color: #4b5563; font-size: 13px; }
+            table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 12px; }
+            th { background-color: #1e3a8a; color: #ffffff; text-align: left; padding: 10px 12px; border: 1px solid #1e40af; }
+            td { padding: 8px 12px; border: 1px solid #e5e7eb; }
+            tr:nth-child(even) td { background-color: #f8fafc; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>Database Creation / Deletion Audit</h2>
+            <p class="sub">Server: <strong>'' + @@SERVERNAME + N''</strong> | Note: <em>OriginalLogin</em> reveals the real account if <code>EXECUTE AS</code> impersonation was used.</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Operation</th>
+                        <th>Database Name</th>
+                        <th>Effective Login</th>
+                        <th>Original Login</th>
+                        <th>Host</th>
+                        <th>Application</th>
+                        <th>Timestamp</th>
+                    </tr>
+                </thead>
+                <tbody>'' + ISNULL(@TableRows, N'''') + N''</tbody>
+            </table>
+        </div>
+    </body>
+    </html>'';
+
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = N'DBA_Notifications',
+        @recipients   = N'dba@anywhere.example',
+        @subject      = @Subject,
+        @body         = @HtmlBody,
+        @body_format  = N'HTML';
+
+    UPDATE msdb.dbo.DBA_TraceWatermark
+    SET LastEventTime = (SELECT MAX(StartTime) FROM #DbEvents)
+    WHERE CheckKey = ''DATABASE_DDL'';
+END
+';
+GO
+
+-- ============================================================================
+-- STEP 2: Notify when a Database User is created or deleted (and who did it)
+-- ============================================================================
+EXEC dbo.sp_add_jobstep
+    @job_name          = N'DatabaseDML',
+    @step_name         = N'Notify Database User Create or Delete',
+    @step_id           = 2,
+    @subsystem         = N'TSQL',
+    @database_name     = N'msdb',
+    @on_success_action = 1, -- Quit with success
+    @command           = N'
+SET NOCOUNT ON;
+
+DECLARE @TracePath NVARCHAR(260);
+SELECT @TracePath = [path] FROM sys.traces WHERE is_default = 1;
+
+IF @TracePath IS NULL RETURN;
+
+DECLARE @LastChecked DATETIME2(3);
+SELECT @LastChecked = LastEventTime
+FROM msdb.dbo.DBA_TraceWatermark
+WHERE CheckKey = ''DBUSER_DDL'';
+
+IF OBJECT_ID(N''tempdb..#UserEvents'') IS NOT NULL DROP TABLE #UserEvents;
+
+SELECT
+    CASE t.EventSubClass
+        WHEN 1 THEN N''USER CREATED (Add)''
+        WHEN 2 THEN N''USER DELETED (Drop)''
+        WHEN 3 THEN N''GRANT DB ACCESS''
+        WHEN 4 THEN N''REVOKE DB ACCESS''
+        ELSE CONCAT(N''SubClass '', t.EventSubClass)
+    END AS Operation,
+    ISNULL(t.DatabaseName, N''-'')     AS DatabaseName,
+    ISNULL(t.TargetUserName, N''-'')   AS TargetDatabaseUser,
+    t.LoginName                        AS EffectiveLogin,
+    t.SessionLoginName                 AS OriginalLogin,
+    ISNULL(t.HostName, N''-'')         AS HostName,
+    ISNULL(t.ApplicationName, N''-'')  AS ApplicationName,
+    t.StartTime
+INTO #UserEvents
+FROM sys.fn_trace_gettable(@TracePath, DEFAULT) t
+WHERE t.EventClass = 109               -- 109 = Audit Add DB User Event
+  AND t.EventSubClass IN (1, 2, 3, 4)
+  AND t.StartTime > @LastChecked;
+
+IF EXISTS (SELECT 1 FROM #UserEvents)
+BEGIN
+    DECLARE @TableRows NVARCHAR(MAX);
+    DECLARE @HtmlBody  NVARCHAR(MAX);
+    DECLARE @Subject   NVARCHAR(255) = N''[SQL Audit] Database User Create/Delete Detected on '' + @@SERVERNAME;
+
+    SELECT @TableRows = (
+        SELECT
+            td = Operation,                                       N'''',
+            td = DatabaseName,                                    N'''',
+            td = TargetDatabaseUser,                              N'''',
+            td = EffectiveLogin,                                  N'''',
+            td = OriginalLogin,                                   N'''',
+            td = HostName,                                        N'''',
+            td = ApplicationName,                                 N'''',
+            td = CONVERT(NVARCHAR(23), StartTime, 121)
+        FROM #UserEvents
+        ORDER BY StartTime ASC
+        FOR XML PATH(''tr''), TYPE
+    ).value(''.'', ''NVARCHAR(MAX)'');
+
+    SET @HtmlBody = N''
+    <html>
+    <head>
+        <style>
+            body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; background-color: #f3f4f6; margin: 0; padding: 20px; }
+            .card { background: #ffffff; border: 1px solid #d1d5db; border-radius: 8px; padding: 20px; max-width: 1050px; }
+            h2 { color: #0f766e; margin-top: 0; }
+            p.sub { color: #4b5563; font-size: 13px; }
+            table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 12px; }
+            th { background-color: #115e59; color: #ffffff; text-align: left; padding: 10px 12px; border: 1px solid #134e4a; }
+            td { padding: 8px 12px; border: 1px solid #e5e7eb; }
+            tr:nth-child(even) td { background-color: #f0fdfa; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>Database User Creation / Deletion Audit</h2>
+            <p class="sub">Server: <strong>'' + @@SERVERNAME + N''</strong> | Tracked via Default Trace (EventClass 109)</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Operation</th>
+                        <th>Database</th>
+                        <th>Target User</th>
+                        <th>Effective Login</th>
+                        <th>Original Login</th>
+                        <th>Host</th>
+                        <th>Application</th>
+                        <th>Timestamp</th>
+                    </tr>
+                </thead>
+                <tbody>'' + ISNULL(@TableRows, N'''') + N''</tbody>
+            </table>
+        </div>
+    </body>
+    </html>'';
+
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = N'DBA_Notifications',
+        @recipients   = N'dba@anywhere.example',
+        @subject      = @Subject,
+        @body         = @HtmlBody,
+        @body_format  = N'HTML';
+
+    UPDATE msdb.dbo.DBA_TraceWatermark
+    SET LastEventTime = (SELECT MAX(StartTime) FROM #UserEvents)
+    WHERE CheckKey = ''DBUSER_DDL'';
+END
+';
+GO
+
+EXEC dbo.sp_add_jobserver
+    @job_name    = N'DatabaseDML',
+    @server_name = N'(local)';
+GO
+```
+
+*(Optional: Attach a recurring SQL Agent schedule—e.g., every 1 or 5 minutes—if you want `DatabaseDML` to run continuously in the background rather than manually.)*
+
+---
+
+### Step 6.3 — Test `DatabaseDML` Using Identity Impersonation (`John`)
+**Task:**
+1. As a `sysadmin`, create a server login named **`John`** that can create and delete databases.
+2. Switch your identity to **`John`** and create a new database as if you were `John`.
+3. Revert back to your initial identity.
+4. Also test deleting the database and creating/deleting a database user, then execute `DatabaseDML` and verify the HTML emails in Papercut SMTP.
+
+#### How to do it
+```sql
+USE [master];
+GO
+
+-- 1. Create SQL Login 'John' (requires Mixed Mode Auth if John were logging in interactively,
+--    though sysadmin impersonation via EXECUTE AS works even under Windows-only mode!)
+IF SUSER_ID(N'John') IS NULL
+BEGIN
+    CREATE LOGIN [John]
+    WITH PASSWORD = N'StrongLabPass!2026',
+         CHECK_POLICY = ON;
+END
+GO
+
+-- Grant John permission to create and delete databases (dbcreator server role)
+ALTER SERVER ROLE [dbcreator] ADD MEMBER [John];
+GO
+
+-- Check identity BEFORE switching
+SELECT SUSER_SNAME() AS EffectiveLogin, ORIGINAL_LOGIN() AS OriginalLogin;
+
+-- 2. Fake your SQL Server identity (Impersonate John)
+EXECUTE AS LOGIN = N'John';
+GO
+
+-- Confirm we are now acting as John (OriginalLogin still records the real sysadmin!)
+SELECT SUSER_SNAME() AS EffectiveLogin, ORIGINAL_LOGIN() AS OriginalLogin;
+
+-- Create a new database as John
+CREATE DATABASE [JohnsLabDB];
+GO
+
+-- 3. Revert back to your initial sysadmin identity
+REVERT;
+GO
+
+SELECT SUSER_SNAME() AS EffectiveLoginAfterRevert, ORIGINAL_LOGIN() AS OriginalLogin;
+GO
+
+-- 4. Test Database User Create & Delete inside JohnsLabDB
+USE [JohnsLabDB];
+GO
+CREATE USER [LabAppUser] WITHOUT LOGIN;
+DROP USER [LabAppUser];
+GO
+
+-- 5. Also test Database Delete (as John, or as yourself)
+USE [master];
+GO
+EXECUTE AS LOGIN = N'John';
+DROP DATABASE [JohnsLabDB];
+REVERT;
+GO
+
+-- 6. Run the DatabaseDML job and check Papercut SMTP!
+EXEC msdb.dbo.sp_start_job @job_name = N'DatabaseDML';
+GO
+```
+
+#### What it achieves
+Demonstrates `EXECUTE AS LOGIN` impersonation and proves that the `DatabaseDML` job detects both database and user create/delete events—while exposing **both** the impersonated `EffectiveLogin` (`John`) and the real `OriginalLogin` (your Windows sysadmin account) in the HTML email table!
+
+#### Key Learnings & Traps
+- **Why `dbcreator` (vs. `CREATE ANY DATABASE` alone):** Adding `John` to the `dbcreator` fixed server role allows `John` to `CREATE`, `ALTER`, `DROP`, and `RESTORE` databases. If you only run `GRANT CREATE ANY DATABASE TO [John]`, `John` can create databases and drop databases *he owns*, but cannot drop databases owned by other logins unless granted `ALTER ANY DATABASE`.
+- **Impersonation Security & Auditing (`EXECUTE AS`):** A `sysadmin` can impersonate any server login using `EXECUTE AS LOGIN = N'...'` without knowing their password. However, SQL Server never hides the true caller: `ORIGINAL_LOGIN()` and Default Trace's `SessionLoginName` still record the underlying authenticated session.
+- **Default Trace Rollover Caveat:** Default Trace maintains up to 5 rolling 20 MB `.trc` files (`100 MB` total). On high-traffic production servers, events can roll off quickly—for long-term compliance auditing, use **SQL Server Audit** or **Extended Events**.
+
+---
+
+### Step 6.4 — Theory Question: Receiving Critical Alerts When Company Mail Services Are Offline
+**Question:** *You rely on mail services for business critical notifications. How do you receive critical information about SQL Server and databases if the company's mail services is offline?*
+
+- **Answer:** Never rely on a single corporate SMTP server as a single point of failure for critical database alerts:
+  1. **Failover SMTP Account / Local Store-and-Forward Relay:**
+     - A Database Mail **Profile** supports multiple **Accounts** with sequence numbers (`@sequence_number = 1, 2, ...`). Add a secondary/external SMTP gateway as sequence `2`, or route through a local SMTP smart-host relay that spools messages on disk and retries delivery when corporate mail recovers.
+  2. **Out-of-Band Monitoring & Non-Email Alert Channels:**
+     - Use dedicated monitoring tools (e.g., Redgate SQL Monitor, SolarWinds DPA, Datadog, SCOM, Zabbix, or Prometheus + Alertmanager) that poll SQL Server health independently and dispatch alerts via **SMS / PagerDuty / Opsgenie**, **Microsoft Teams / Slack webhooks**, **mobile push notifications**, or **SNMP traps**—all of which bypass corporate Exchange/SMTP entirely.
+  3. **Windows Application Event Log & SQL Server Error Log Forwarding:**
+     - Configure SQL Server Agent Alerts (`sp_add_alert`) and `DBCC CHECKDB` jobs (`WITH LOG`) to write critical errors to the **Windows Application Event Log** and **SQL Server Error Log**. Endpoint log shippers (e.g., Azure Monitor Agent, Splunk, Elastic/Winlogbeat) forward those logs out-of-band even when SMTP is dead.
+  4. **Local Persistent Audit Table & Dead-Letter Checks:**
+     - Log critical findings to a local DBA utility table before calling `sp_send_dbmail`, and monitor `msdb.dbo.sysmail_faileditems` / `sysmail_unsentitems` so alerts aren't silently lost during an outage.
+
+---
+
+## Part 7: Self-Study — Steve Stedman's Database Corruption Challenges
+
+**Reference:** `https://stevestedman.com/server-health/database-corruption-challenge/`
+
+Steve Stedman's **Database Corruption Challenge** is a classic set of 10+ real-world corruption scenarios (corrupted clustered/non-clustered indexes, damaged `LOB` pages, corrupt `sys` metadata, damaged transaction logs, etc.) originally built for hands-on DBA training.
+
+#### How to Safely Practice in Your Lab
+1. **Download a challenge `.bak` file** (start with *Week 1* or *Week 2*—note that older challenges were backed up on earlier SQL Server versions and restore cleanly onto SQL Server 2025 with `WITH MOVE`).
+2. **Restore it under an isolated name** into `C:\Exo\Database` (inspect `RESTORE FILELISTONLY` first!).
+3. **Run your new `CheckDB` SQL Agent job** (from Step 6.1) or `DBCC CHECKDB (...) WITH NO_INFOMSGS, ALL_ERRORMSGS` to see the exact corruption report and receive the HTML alert in Papercut SMTP.
+4. **Practice zero-data-loss recovery techniques** before ever resorting to `REPAIR_ALLOW_DATA_LOSS`:
+   - Inspect damaged 8 KB pages with `DBCC TRACEON (3604); DBCC PAGE (DBName, FileId, PageId, 3);`
+   - Determine whether the corruption is only in a **Non-Clustered Index** (fixable by rebuilding/recreating the index) vs. a **Clustered Index / Heap** (fixable by restoring from a clean backup + log tail, or extracting uncorrupted rows / reconstructing from non-clustered covering indexes).
+5. **Drop the challenge database** when finished so your `CheckDB` job returns to a clean baseline.
+
+---
+
+## Part 8: System-Versioned Temporal Tables (`AdventureWorksLT2022` History Table)
+
+A **System-Versioned Temporal Table** automatically maintains a full historical audit trail of every `UPDATE` and `DELETE` in a paired **History Table**, letting you query data *"as of"* any point in time (`FOR SYSTEM_TIME AS OF ...`).
+
+### Step 8.1 — T-SQL Eligibility Check Script Across All Tables in a Database
+**Task:** Create a T-SQL script that accepts a database variable, loops through all tables in that database, checks if each table meets the requirements for a system-versioned history table, and outputs a list of eligible table names **prefixed with schema name**.
+
+#### Requirements Checked by the Script
+For an existing table in SQL Server to be converted into a **system-versioned temporal table** (with a paired history table):
+1. Must be a **user table** (`is_ms_shipped = 0`) and **not already temporal or a history table** (`temporal_type = 0`).
+2. Must have a **Primary Key** defined (`OBJECTPROPERTY(object_id, 'TableHasPrimaryKey') = 1`).
+3. Must **not** be a `FILETABLE` (`is_filetable = 0`) and must **not** contain `FILESTREAM` columns (`filestream_data_space_id IS NULL` and no `is_filestream = 1` column).
+4. Must **not** be an external table (`is_external = 0`), graph node/edge table (`is_node = 0 AND is_edge = 0`), or ledger table (`ledger_type = 0`).
+5. Must **not** have any **`INSTEAD OF` triggers** (`is_instead_of_trigger = 1`), because `INSTEAD OF` triggers are prohibited on temporal tables.
+*(Note: In SQL Server 2017–2025, `ON DELETE/UPDATE CASCADE` foreign keys and computed columns are supported on the current table, though computed columns become regular static columns in the history table.)*
+
+#### How to do it
+```sql
+USE [master];
+GO
+
+SET NOCOUNT ON;
+
+-- ============================================================================
+-- INPUT VARIABLE: Set target database name
+-- ============================================================================
+DECLARE @DatabaseName SYSNAME = N'AdventureWorksLT2022';
+
+IF DB_ID(@DatabaseName) IS NULL
+BEGIN
+    RAISERROR(N'Database "%s" does not exist.', 16, 1, @DatabaseName);
+    RETURN;
+END
+
+-- Staging table for all tables discovered in @DatabaseName
+IF OBJECT_ID(N'tempdb..#TableList') IS NOT NULL DROP TABLE #TableList;
+CREATE TABLE #TableList (
+    RowID          INT IDENTITY(1,1) PRIMARY KEY,
+    SchemaName     SYSNAME,
+    TableName      SYSNAME,
+    FullTableName  NVARCHAR(300),
+    IsEligible     BIT DEFAULT 0,
+    IneligibleReason NVARCHAR(500) NULL
+);
+
+DECLARE @Sql NVARCHAR(MAX);
+
+-- Populate table list from target database
+SET @Sql = N'
+SELECT
+    s.name AS SchemaName,
+    t.name AS TableName,
+    s.name + N''.'' + t.name AS FullTableName
+FROM ' + QUOTENAME(@DatabaseName) + N'.sys.tables t
+JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.schemas s ON t.schema_id = s.schema_id
+WHERE t.is_ms_shipped = 0
+ORDER BY s.name, t.name;';
+
+INSERT INTO #TableList (SchemaName, TableName, FullTableName)
+EXEC (@Sql);
+
+-- Loop through every table in @DatabaseName and evaluate temporal requirements
+DECLARE @CurrentRowID  INT = 1;
+DECLARE @MaxRowID      INT = (SELECT MAX(RowID) FROM #TableList);
+DECLARE @SchemaName    SYSNAME;
+DECLARE @TableName     SYSNAME;
+DECLARE @HasPK         BIT;
+DECLARE @TemporalType  TINYINT;
+DECLARE @IsUnsupported BIT;
+DECLARE @HasInsteadOf  BIT;
+DECLARE @Reason        NVARCHAR(500);
+
+WHILE @CurrentRowID <= @MaxRowID
+BEGIN
+    SELECT @SchemaName = SchemaName, @TableName = TableName
+    FROM #TableList
+    WHERE RowID = @CurrentRowID;
+
+    SET @HasPK         = 0;
+    SET @TemporalType  = 0;
+    SET @IsUnsupported = 0;
+    SET @HasInsteadOf  = 0;
+    SET @Reason        = N'';
+
+    SET @Sql = N'
+    SELECT
+        @pHasPK = CASE WHEN EXISTS (
+            SELECT 1 FROM ' + QUOTENAME(@DatabaseName) + N'.sys.key_constraints kc
+            WHERE kc.parent_object_id = t.object_id AND kc.type = ''PK''
+        ) THEN 1 ELSE 0 END,
+        @pTemporalType = t.temporal_type,
+        @pIsUnsupported = CASE WHEN (
+            t.is_filetable = 1
+            OR t.is_external = 1
+            OR t.is_node = 1
+            OR t.is_edge = 1
+            OR t.ledger_type <> 0
+            OR t.filestream_data_space_id IS NOT NULL
+            OR EXISTS (
+                SELECT 1 FROM ' + QUOTENAME(@DatabaseName) + N'.sys.columns c
+                WHERE c.object_id = t.object_id AND c.is_filestream = 1
+            )
+        ) THEN 1 ELSE 0 END,
+        @pHasInsteadOf = CASE WHEN EXISTS (
+            SELECT 1 FROM ' + QUOTENAME(@DatabaseName) + N'.sys.triggers tr
+            WHERE tr.parent_id = t.object_id AND tr.is_instead_of_trigger = 1
+        ) THEN 1 ELSE 0 END
+    FROM ' + QUOTENAME(@DatabaseName) + N'.sys.tables t
+    JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.schemas s ON t.schema_id = s.schema_id
+    WHERE s.name = @pSchemaName AND t.name = @pTableName;';
+
+    EXEC sp_executesql
+        @Sql,
+        N'@pSchemaName SYSNAME, @pTableName SYSNAME, @pHasPK BIT OUTPUT, @pTemporalType TINYINT OUTPUT, @pIsUnsupported BIT OUTPUT, @pHasInsteadOf BIT OUTPUT',
+        @pSchemaName    = @SchemaName,
+        @pTableName     = @TableName,
+        @pHasPK         = @HasPK OUTPUT,
+        @pTemporalType  = @TemporalType OUTPUT,
+        @pIsUnsupported = @IsUnsupported OUTPUT,
+        @pHasInsteadOf  = @HasInsteadOf OUTPUT;
+
+    IF @TemporalType <> 0
+        SET @Reason += N'Already a temporal or history table; ';
+    IF @HasPK = 0
+        SET @Reason += N'Missing Primary Key; ';
+    IF @IsUnsupported = 1
+        SET @Reason += N'Uses FileTable/FILESTREAM/External/Graph/Ledger; ';
+    IF @HasInsteadOf = 1
+        SET @Reason += N'Has INSTEAD OF trigger; ';
+
+    UPDATE #TableList
+    SET IsEligible       = CASE WHEN LEN(@Reason) = 0 THEN 1 ELSE 0 END,
+        IneligibleReason = NULLIF(@Reason, N'')
+    WHERE RowID = @CurrentRowID;
+
+    SET @CurrentRowID += 1;
+END
+
+-- Required Output: Schema-prefixed list of tables where a history table can be applied
+SELECT FullTableName AS [EligibleTables_For_HistoryTable]
+FROM #TableList
+WHERE IsEligible = 1
+ORDER BY FullTableName;
+
+-- Optional Diagnostic View: See all tables and any blockers
+-- SELECT FullTableName, IsEligible, IneligibleReason FROM #TableList ORDER BY FullTableName;
+GO
+```
+
+#### Expected Result on `AdventureWorksLT2022`
+Every standard table in `AdventureWorksLT2022` (`dbo.BuildVersion`, `dbo.ErrorLog`, `SalesLT.Address`, `SalesLT.Customer`, `SalesLT.CustomerAddress`, `SalesLT.Product`, `SalesLT.ProductCategory`, `SalesLT.ProductDescription`, `SalesLT.ProductModel`, `SalesLT.ProductModelProductDescription`, `SalesLT.SalesOrderDetail`, `SalesLT.SalesOrderHeader`, plus `SalesLT.TableA` from Step 1.8) has a Primary Key and no `FILESTREAM` or `INSTEAD OF` triggers, so all of them appear in `[EligibleTables_For_HistoryTable]`.
+
+---
+
+### Step 8.2 — Enable System-Versioning (History Table) on `SalesLT.Product`
+**Task:** Choose one table from the eligible list (e.g., `SalesLT.Product`) and create a history table for it.
+
+#### How to do it
+Because `SalesLT.Product` already contains existing rows, we:
+1. Add the two mandatory `DATETIME2` period columns (`ValidFrom` and `ValidTo`) with `DEFAULT` constraints (and `HIDDEN` so existing `SELECT *` queries continue returning the original columns seamlessly).
+2. Define `PERIOD FOR SYSTEM_TIME (ValidFrom, ValidTo)`.
+3. Enable `SYSTEM_VERSIONING = ON` and explicitly name the history table `SalesLT.ProductHistory` (so SQL Server doesn't generate a random name like `MSSQL_TemporalHistoryFor_...`).
+
+```sql
+USE [AdventureWorksLT2022];
+GO
+
+-- 1. Add temporal period columns with defaults for existing rows, and mark them HIDDEN
+ALTER TABLE SalesLT.Product
+ADD
+    ValidFrom DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL
+        CONSTRAINT DF_Product_ValidFrom DEFAULT SYSUTCDATETIME(),
+    ValidTo   DATETIME2 GENERATED ALWAYS AS ROW END   HIDDEN NOT NULL
+        CONSTRAINT DF_Product_ValidTo   DEFAULT CONVERT(DATETIME2, '9999-12-31 23:59:59.9999999'),
+    PERIOD FOR SYSTEM_TIME (ValidFrom, ValidTo);
+GO
+
+-- 2. Enable System-Versioning and create SalesLT.ProductHistory
+ALTER TABLE SalesLT.Product
+SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = SalesLT.ProductHistory));
+GO
+
+-- 3. Verify temporal metadata in sys.tables
+SELECT
+    SCHEMA_NAME(t.schema_id) + N'.' + t.name AS TableName,
+    t.temporal_type_desc,
+    OBJECT_SCHEMA_NAME(t.history_table_id) + N'.' + OBJECT_NAME(t.history_table_id) AS HistoryTableName
+FROM sys.tables t
+WHERE t.object_id = OBJECT_ID(N'SalesLT.Product');
+GO
+```
+
+#### What it achieves
+Turns `SalesLT.Product` into a live System-Versioned Temporal Table backed by `SalesLT.ProductHistory`. Any future `UPDATE` or `DELETE` automatically archives the previous row version into `SalesLT.ProductHistory` with exact UTC validity timestamps.
+
+#### Key Learnings & Traps
+- **Why `HIDDEN`?** Marking `ValidFrom` and `ValidTo` as `HIDDEN` keeps `SELECT * FROM SalesLT.Product` compatible with existing applications/reports; you can still explicitly select `ValidFrom, ValidTo` whenever you want to see them.
+- **Why `DEFAULT` constraints are required here:** You cannot add `NOT NULL` `GENERATED ALWAYS AS ROW START/END` columns to a non-empty table without `DEFAULT` values to backfill existing rows.
+- **History Table Constraints:** `SalesLT.ProductHistory` automatically mirrors the column types of `SalesLT.Product` (with a clustered index on `(ValidTo, ValidFrom)` created by SQL Server) and has **no Primary Key, Foreign Keys, or triggers**, because multiple historical versions of the same `ProductID` will live inside it.
+
+---
+
+### Step 8.3 — Test the Temporal / History Table Solution
+**Task:** Test `INSERT`, `UPDATE`, `DELETE`, and point-in-time temporal queries against `SalesLT.Product` and `SalesLT.ProductHistory`.
+
+#### How to do it
+*(Using a dedicated test row so we don't disturb foreign keys on existing AdventureWorks products!)*
+```sql
+USE [AdventureWorksLT2022];
+GO
+
+-- 1. Insert a new test product
+INSERT INTO SalesLT.Product (Name, ProductNumber, Color, StandardCost, ListPrice, SellStartDate)
+VALUES (N'Temporal Test Bike', N'TT-BIKE-001', N'Black', 500.00, 999.00, SYSUTCDATETIME());
+
+DECLARE @TestProductID INT = SCOPE_IDENTITY();
+WAITFOR DELAY '00:00:02';
+
+-- Capture a timestamp while ListPrice was 999.00
+DECLARE @TimeWhen999 DATETIME2 = SYSUTCDATETIME();
+WAITFOR DELAY '00:00:02';
+
+-- 2. Update the product price (archives the 999.00 row into SalesLT.ProductHistory!)
+UPDATE SalesLT.Product
+SET ListPrice = 1299.00, Color = N'Red'
+WHERE ProductID = @TestProductID;
+
+WAITFOR DELAY '00:00:02';
+
+-- 3. Delete the test product (archives the 1299.00 row into SalesLT.ProductHistory!)
+DELETE FROM SalesLT.Product
+WHERE ProductID = @TestProductID;
+
+-- 4. Time-travel query: see the product as it existed at @TimeWhen999 (before update & delete)
+SELECT ProductID, Name, Color, ListPrice, ValidFrom, ValidTo
+FROM SalesLT.Product
+FOR SYSTEM_TIME AS OF @TimeWhen999
+WHERE ProductID = @TestProductID;
+GO
+
+-- 5. Inspect current table (0 rows for TT-BIKE-001) vs. History Table (2 historical versions!)
+SELECT ProductID, Name, Color, ListPrice
+FROM SalesLT.Product
+WHERE ProductNumber = N'TT-BIKE-001';
+
+SELECT ProductID, Name, Color, ListPrice, ValidFrom, ValidTo
+FROM SalesLT.ProductHistory
+WHERE ProductNumber = N'TT-BIKE-001'
+ORDER BY ValidFrom;
+GO
+
+-- 6. Query across BOTH current + history automatically using FOR SYSTEM_TIME ALL
+SELECT ProductID, Name, Color, ListPrice, ValidFrom, ValidTo
+FROM SalesLT.Product
+FOR SYSTEM_TIME ALL
+WHERE ProductNumber = N'TT-BIKE-001'
+ORDER BY ValidFrom;
+GO
+```
+
+#### Key Learnings & Intentional Traps
+- **Trap (`DROP TABLE` Blocked):** While `SYSTEM_VERSIONING = ON`, SQL Server intentionally blocks `DROP TABLE SalesLT.Product`, `TRUNCATE TABLE SalesLT.Product`, and direct `INSERT/UPDATE/DELETE` on `SalesLT.ProductHistory`. To drop or alter a history table, you must first run `ALTER TABLE SalesLT.Product SET (SYSTEM_VERSIONING = OFF);`.
+- **UTC Timestamps:** `ValidFrom` and `ValidTo` always use **UTC** (`SYSUTCDATETIME()`), not local server time (`GETDATE()`). Keep this in mind when passing timestamps to `FOR SYSTEM_TIME AS OF`!
+
