@@ -1,4 +1,4 @@
-3# Database Opgave — Step-by-Step Guide & Learnings
+# Database Opgave — Step-by-Step Guide & Learnings
 
 This guide walks through every task from your database assignment emails in chronological order. Because the assignment states **"Use T-SQL in solutions unless otherwise stated"** and **"Some of the tasks will intentionally give you errors"**, each step below includes:
 1. **How to do it** (T-SQL scripts and/or GUI steps)
@@ -767,9 +767,363 @@ When `DBCC CHECKDB` finds corruption, its output will state the **minimum repair
 
 ---
 
-## Part 5: `MS SQL Server DatabaseMail Configuration` (Prerequisites)
+## Part 4A: `2020.Q.RESTORE.CHECKDB.Database.Integrity.Corruption3`
 
-Before SQL Server Agent jobs can send email alerts in Part 6, you need a working local SMTP server and Database Mail configured on your SQL Server instance.
+### Step 4A.1 — Copy and Restore `Corruption3.bak`
+**Task:** Restore `Corruption3` from `Corruption3.bak` if it doesn't exist.
+
+#### How to do it
+1. **Copy `Corruption3.bak` to `C:\Exo\Database`** (so the SQL Server service account `NT Service\MSSQL$EXO` can read it):
+   ```powershell
+   Copy-Item "C:\Users\Gustav Fausing\Database-Opgave\Corruption3.bak" "C:\Exo\Database\Corruption3.bak"
+   ```
+
+2. **Inspect the logical file names inside `Corruption3.bak` first** (`RESTORE FILELISTONLY`):
+   ```sql
+   USE [master];
+   GO
+
+   RESTORE FILELISTONLY
+   FROM DISK = N'C:\Exo\Database\Corruption3.bak';
+   GO
+   ```
+   *(Notice the logical names inside the backup are **`SalesDBData`** and **`SalesDBLog`**, NOT `Corruption3`!)*
+
+3. **Restore `Corruption3` using `WITH MOVE`:**
+   ```sql
+   IF DB_ID(N'Corruption3') IS NULL
+   BEGIN
+       RESTORE DATABASE [Corruption3]
+       FROM DISK = N'C:\Exo\Database\Corruption3.bak'
+       WITH MOVE N'SalesDBData' TO N'C:\Exo\Database\Corruption3.mdf',
+            MOVE N'SalesDBLog'  TO N'C:\Exo\Database\Corruption3_log.ldf',
+            RECOVERY, STATS = 10;
+   END
+   GO
+   ```
+
+#### What it achieves
+Restores the `Corruption3` database onto your SQL Server instance (`EXOPI-908\EXO`) with its `.mdf` and `.ldf` files stored cleanly in `C:\Exo\Database`.
+
+#### Key Learnings & Intentional Traps
+- **Trap 1 (NTFS Permissions on User Profile Folder):** If you run `RESTORE FILELISTONLY` or `RESTORE DATABASE` directly against `C:\Users\Gustav Fausing\Database-Opgave\Corruption3.bak`, SQL Server fails with **`Msg 3201: Operating system error 5(Access is denied.)`** because `NT Service\MSSQL$EXO` does not have NTFS read permission inside your personal user profile folder. Always move/copy `.bak` files into `C:\Exo\Database` first.
+- **Trap 2 (Unexpected Logical File Names):** Guessing `MOVE N'Corruption3'` fails because the backup's internal logical names are `SalesDBData` and `SalesDBLog`. Always run `RESTORE FILELISTONLY` first!
+
+---
+
+### Step 4A.2 — Run `DBCC CHECKDB` on `Corruption3`
+**Task:** Run `DBCC CHECKDB (Corruption3) WITH NO_INFOMSGS, ALL_ERRORMSGS;` in SSMS and inspect the consistency errors.
+
+#### How to do it
+```sql
+DBCC CHECKDB (N'Corruption3')
+WITH NO_INFOMSGS, ALL_ERRORMSGS;
+GO
+```
+
+**Observed Output Summary:**
+```text
+Msg 8951, Level 16, State 1, ...
+Table error: table 'Customers' (ID 453576654). Data row does not have a matching index row in the index 'CustomerName' (ID 2). Possible missing or invalid keys for the index row matching:
+Msg 8955, Level 16, State 1, ...
+Data row (1:45:28) identified by (CustomerID = 29) with index values 'LastName = 'Adams' and CustomerID = 29'.
+...
+Msg 8952, Level 16, State 1, ...
+Table error: table 'Customers' (ID 453576654). Index row in index 'CustomerName' (ID 2) does not match any data row. Possible extra or invalid keys for:
+Msg 8956, Level 16, State 1, ...
+Index row (1:24480:20) with values (LastName = 'Adams' and CustomerID = 2078) pointing to the data row identified by (CustomerID = 2078).
+...
+CHECKDB found 0 allocation errors and 26 consistency errors in table 'Customers' (object ID 453576654).
+CHECKDB found 0 allocation errors and 26 consistency errors in database 'Corruption3'.
+repair_rebuild is the minimum repair level for the errors found by DBCC CHECKDB (Corruption3).
+```
+
+#### What it achieves
+Identifies the exact object, index, error count, and minimum safe repair level required.
+
+---
+
+### Step 4A.3 — Assignment Questions & Solutions (`Corruption3`)
+
+1. **Where does SQL Server save the output produced by `CHECKDB`?**
+   - **Primary / Detailed Output:** Returned directly to the **calling client session** (the SSMS **Messages** tab, `sqlcmd` stdout, or a SQL Agent job step's output file if configured). SQL Server does **not** automatically save the full `DBCC CHECKDB` row-by-row output into a permanent system table.
+   - **Summary Log:** SQL Server writes a **summary entry** (e.g., `DBCC CHECKDB (Corruption3) executed by ... found 26 errors and repaired 0 errors`) to the **SQL Server Error Log (`ERRORLOG`)** and the **Windows Application Event Log**.
+   - *(Tip)*: If you want to persist detailed results in SQL Server, run `DBCC CHECKDB (N'Corruption3') WITH TABLERESULTS, NO_INFOMSGS, ALL_ERRORMSGS;` and `INSERT` the result set into a custom audit table.
+
+2. **Is the `Corruption3` database usable?**
+   - **Yes, technically it is `ONLINE` and accessible**, because the corruption is isolated inside a single **non-clustered index (`CustomerName`)** on `dbo.Customers`, while the base data pages (`CustomerPK` clustered index) and allocation maps are intact.
+   - Queries that do not touch `dbo.Customers`—or queries that read `dbo.Customers` via the clustered index `CustomerPK`—will succeed normally. However, queries that use the `CustomerName` non-clustered index may fail or silently return wrong results.
+
+3. **If you query the database, can you trust your query results?**
+   - **No!** Because `CustomerName` has **26 out-of-sync index rows**:
+     - Queries filtering or sorting by `LastName` that choose an Index Seek/Scan on `CustomerName` can **miss valid rows** (`Msg 8951` — row exists in the table, missing from index) or **return phantom/wrong matches** (`Msg 8952` — index entry points to a non-matching row).
+     - Depending on which execution plan the Query Optimizer picks (Clustered Index Scan vs. Non-Clustered Index Seek), the *same logical query* can return **different row counts and different data**. Therefore, results **cannot be trusted** until repaired.
+
+4. **What is wrong with the database?**
+   - There are **0 allocation errors** and **26 logical consistency errors** in table **`dbo.Customers`** (`object ID 453576654`), specifically inside the **non-clustered index `CustomerName` (`index ID 2`)** on column `LastName` (which includes clustered key `CustomerID`):
+     - **Missing index rows (`Msg 8951 / 8955`):** Data rows exist in the clustered index `CustomerPK` that are missing from `CustomerName`.
+     - **Extra/invalid index rows (`Msg 8952 / 8956`):** Entries exist in `CustomerName` that do not match any valid row in `CustomerPK`.
+   - Because the underlying table data (`CustomerPK`) is healthy, `DBCC CHECKDB` reports **`repair_rebuild is the minimum repair level`** (meaning **0 data loss**).
+
+5. **T-SQL to solve the consistency errors (and verify 0 errors):**
+
+   First, inspect the indexes on `dbo.Customers`:
+   ```sql
+   USE [Corruption3];
+   GO
+   EXEC sp_helpindex N'dbo.Customers';
+   GO
+   ```
+   *(Shows `CustomerPK` [clustered, unique, PK on `CustomerID`] and `CustomerName` [nonclustered on `LastName`].)*
+
+   **Option A (Recommended — Online / No `SINGLE_USER` Downtime): `DISABLE` then `REBUILD` the index**
+   ```sql
+   USE [Corruption3];
+   GO
+
+   -- 1. Disable the corrupted non-clustered index first (CRITICAL!)
+   ALTER INDEX [CustomerName] ON [dbo].[Customers] DISABLE;
+   GO
+
+   -- 2. Rebuild it from the intact clustered index (CustomerPK)
+   ALTER INDEX [CustomerName] ON [dbo].[Customers] REBUILD;
+   GO
+
+   -- 3. Verify 0 errors
+   DBCC CHECKDB (N'Corruption3') WITH NO_INFOMSGS, ALL_ERRORMSGS;
+   GO
+   ```
+
+   **Option B (Alternative Online Method): `DROP` and `CREATE` the non-clustered index**
+   ```sql
+   USE [Corruption3];
+   GO
+
+   DROP INDEX [CustomerName] ON [dbo].[Customers];
+   GO
+
+   CREATE NONCLUSTERED INDEX [CustomerName]
+       ON [dbo].[Customers] ([LastName] ASC);
+   GO
+
+   DBCC CHECKDB (N'Corruption3') WITH NO_INFOMSGS, ALL_ERRORMSGS;
+   GO
+   ```
+
+   **Option C (Using `DBCC CHECKDB ... REPAIR_REBUILD` — Requires `SINGLE_USER` downtime)**
+   ```sql
+   USE [master];
+   GO
+
+   ALTER DATABASE [Corruption3] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+   GO
+
+   DBCC CHECKDB (N'Corruption3', REPAIR_REBUILD)
+   WITH NO_INFOMSGS, ALL_ERRORMSGS;
+   GO
+
+   ALTER DATABASE [Corruption3] SET MULTI_USER;
+   GO
+
+   DBCC CHECKDB (N'Corruption3') WITH NO_INFOMSGS, ALL_ERRORMSGS;
+   GO
+   ```
+
+#### Key Learnings & Intentional Traps
+- **INTENTIONAL TRAP (`ALTER INDEX ... REBUILD` Alone Does NOT Fix It!):**
+  If you run `ALTER INDEX [CustomerName] ON [dbo].[Customers] REBUILD;` *without* disabling or dropping it first, **SQL Server scans the existing corrupted non-clustered index itself** to build the new index pages—carrying all **26 consistency errors** right into the rebuilt index! You **must** run `DISABLE` + `REBUILD` (forcing SQL Server to scan the healthy `CustomerPK` clustered index), `DROP` + `CREATE`, or `REPAIR_REBUILD`.
+
+---
+
+## Part 4B: `Corruption4` — Power Failure Simulation (No Backup Files!)
+
+**Context:** Power failure simulation. You are given only `Corruption4.mdf` and `Corruption4_log.ldf` and have **no database backup files (`.bak`)**. Your goal is to bring `Corruption4` back `ONLINE` so `DBCC CHECKDB` runs with **0 errors**.
+
+---
+
+### Step 4B.1 — Copy Files to `C:\Exo\Database` and Fix NTFS Permissions
+**Task:** Place `Corruption4.mdf` and `Corruption4_log.ldf` in `C:\Exo\Database` with proper NTFS permissions so SQL Server can attach them.
+
+#### How to do it
+In PowerShell (keep a clean copy of the original files in `Database-Opgave` in case you want to practice again):
+```powershell
+Copy-Item "C:\Users\Gustav Fausing\Database-Opgave\Corruption4.mdf" "C:\Exo\Database\Corruption4.mdf"
+Copy-Item "C:\Users\Gustav Fausing\Database-Opgave\Corruption4_log.ldf" "C:\Exo\Database\Corruption4_log.ldf"
+
+# Remove Mark-of-the-Web (if downloaded) and grant Full Control to SQL Server + your user
+Unblock-File "C:\Exo\Database\Corruption4.mdf", "C:\Exo\Database\Corruption4_log.ldf"
+icacls "C:\Exo\Database\Corruption4.mdf"     /grant "NT SERVICE\MSSQL`$EXO:F" "$($env:USERNAME):F"
+icacls "C:\Exo\Database\Corruption4_log.ldf" /grant "NT SERVICE\MSSQL`$EXO:F" "$($env:USERNAME):F"
+```
+
+#### What it achieves
+Places the files in your SQL directory and gives both the SQL Server service account (`NT SERVICE\MSSQL$EXO`) and your Windows user account explicit Full Control.
+
+#### Key Learnings & Intentional Trap
+- **Trap (`Msg 5120: Operating system error 5 (Access is denied.)`):** Unlike `RESTORE DATABASE` (where SQL Server creates fresh `.mdf`/`.ldf` files it owns), `CREATE DATABASE ... FOR ATTACH` opens *existing* files you copied manually. If `NT SERVICE\MSSQL$EXO` and your attaching Windows user lack Full Control (e.g., because `BUILTIN\Users` only has Read & Execute on `C:\Exo\Database` and UAC strips `BUILTIN\Administrators`), attaching fails with `Access is denied`.
+
+---
+
+### Step 4B.2 — Attempt Normal Attach & Rebuild-Log Attach (Observe the Failures)
+**Task:** Test why standard attach methods fail on a power-failure-damaged database.
+
+#### How to do it
+1. **Inspect internal file metadata first (read-only):**
+   ```sql
+   DBCC CHECKPRIMARYFILE (N'C:\Exo\Database\Corruption4.mdf', 3);
+   GO
+   ```
+   *(Confirms logical names `Corruption4` and `Corruption4_log`.)*
+
+2. **Attempt #1: Standard `FOR ATTACH`:**
+   ```sql
+   USE [master];
+   GO
+
+   CREATE DATABASE [Corruption4]
+   ON (FILENAME = N'C:\Exo\Database\Corruption4.mdf'),
+      (FILENAME = N'C:\Exo\Database\Corruption4_log.ldf')
+   FOR ATTACH;
+   GO
+   ```
+   **Observed Error:**
+   ```text
+   Msg 824, Level 24, State 6, ...
+   SQL Server detected a logical consistency-based I/O error: incorrect checksum (expected: 0x0b407bbf; actual: 0xf4bf8440). It occurred during a read of page (0:0) in database ID 0 at offset 0000000000000000 in file 'C:\Exo\Database\Corruption4_log.ldf'.
+   ```
+   *(The header page `(0:0)` of `Corruption4_log.ldf` is corrupted!)*
+
+3. **Attempt #2: Attach without the corrupted `.ldf` using `FOR ATTACH_REBUILD_LOG`:**
+   ```sql
+   CREATE DATABASE [Corruption4]
+   ON (FILENAME = N'C:\Exo\Database\Corruption4.mdf')
+   FOR ATTACH_REBUILD_LOG;
+   GO
+   ```
+   **Observed Error:**
+   ```text
+   Msg 1813, Level 16, State 2, ...
+   File activation failure. The physical file name "C:\Exo\Database\Corruption4_log.ldf" may be incorrect.
+   The log cannot be rebuilt because there were open transactions/users when the database was shutdown, no checkpoint occurred to the database, or the database was read-only.
+   ```
+
+#### What it achieves
+Diagnoses the exact root cause: the `.ldf` file header is corrupt (`Msg 824`), **and** because the database suffered an unclean shutdown (simulated power failure with open transactions), SQL Server refuses to simply attach and rebuild the log (`Msg 1813`).
+
+---
+
+### Step 4B.3 — Perform the DBA "Hack-Attach" + `EMERGENCY` Mode Recovery
+**Task:** Register `Corruption4.mdf` inside SQL Server's system catalogs using a temporary dummy database, switch to `EMERGENCY` mode, rebuild the log, and repair all corruption.
+
+#### How to do it
+```sql
+USE [master];
+GO
+
+-- 1. Create a dummy database with the exact same name & logical file layout
+CREATE DATABASE [Corruption4]
+ON (NAME = N'Corruption4',     FILENAME = N'C:\Exo\Database\Corruption4_dummy.mdf')
+LOG ON (NAME = N'Corruption4_log', FILENAME = N'C:\Exo\Database\Corruption4_dummy_log.ldf');
+GO
+
+-- 2. Take the dummy database OFFLINE so SQL Server releases its file handles
+ALTER DATABASE [Corruption4] SET OFFLINE WITH ROLLBACK IMMEDIATE;
+GO
+
+-- 3. Point [Corruption4] in master's catalog to the REAL Corruption4.mdf and a fresh log filename
+ALTER DATABASE [Corruption4]
+MODIFY FILE (NAME = N'Corruption4',     FILENAME = N'C:\Exo\Database\Corruption4.mdf');
+GO
+ALTER DATABASE [Corruption4]
+MODIFY FILE (NAME = N'Corruption4_log', FILENAME = N'C:\Exo\Database\Corruption4_rebuilt_log.ldf');
+GO
+
+-- 4. Attempt SET ONLINE (Expected to fail because the log does not exist/cannot be rebuilt cleanly)
+ALTER DATABASE [Corruption4] SET ONLINE;
+GO
+
+-- 5. Put the database into EMERGENCY mode (read-only bypass that ignores the missing/corrupt log)
+ALTER DATABASE [Corruption4] SET EMERGENCY;
+GO
+```
+
+*(Note: If the `MODIFY FILE` log path matches an existing file like `C:\Exo\Database\Corruption4_log.ldf` that lacks `NT SERVICE\MSSQL$EXO:(F)`, rename the damaged log file to `Corruption4_log.ldf.corrupt` before running `REPAIR_ALLOW_DATA_LOSS`. You can also delete unused `Corruption4_dummy.*` files later.)*
+
+#### What it achieves
+Tricks SQL Server into attaching `Corruption4.mdf` into `sys.databases` and brings it into **`EMERGENCY`** state (`MULTI_USER`, read-only) so `DBCC CHECKDB` can inspect and repair it.
+
+---
+
+### Step 4B.4 — Diagnose, Rebuild the Log, and Repair `Corruption4`
+**Task:** Run `DBCC CHECKDB`, repair the database, bring it `ONLINE` in `MULTI_USER` mode, and confirm `CHECKDB` reports **0 errors**.
+
+#### How to do it
+```sql
+USE [master];
+GO
+
+-- 1. Check what corruption exists inside Corruption4.mdf while in EMERGENCY mode
+DBCC CHECKDB (N'Corruption4') WITH NO_INFOMSGS, ALL_ERRORMSGS;
+GO
+```
+**Observed Output:**
+```text
+Msg 8951, Level 16, State 1, ...
+Table error: table 'sys.sysiscols' (ID 55). Data row does not have a matching index row in the index 'nc1' (ID 2).
+...
+CHECKDB found 0 allocation errors and 1 consistency errors in table 'sys.sysiscols' (object ID 55).
+CHECKDB found 0 allocation errors and 1 consistency errors in database 'Corruption4'.
+repair_rebuild is the minimum repair level for the errors found by DBCC CHECKDB (Corruption4).
+```
+
+Now run the repair and return the database to `ONLINE` / `MULTI_USER`:
+```sql
+-- 2. Switch to SINGLE_USER (required for DBCC repair)
+ALTER DATABASE [Corruption4] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+GO
+
+-- 3. Rebuild the missing transaction log AND fix the sys.sysiscols index error
+DBCC CHECKDB (N'Corruption4', REPAIR_ALLOW_DATA_LOSS)
+WITH NO_INFOMSGS, ALL_ERRORMSGS;
+GO
+
+-- 4. Return database to normal MULTI_USER access
+ALTER DATABASE [Corruption4] SET MULTI_USER;
+GO
+
+-- 5. Verify database state and confirm 0 CHECKDB errors
+SELECT name, state_desc, user_access_desc
+FROM sys.databases
+WHERE name = N'Corruption4';
+GO
+
+DBCC CHECKDB (N'Corruption4') WITH NO_INFOMSGS, ALL_ERRORMSGS;
+GO
+
+-- 6. (Recommended) Check foreign-key constraint integrity after REPAIR_ALLOW_DATA_LOSS
+USE [Corruption4];
+GO
+DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS;
+GO
+```
+
+#### What it achieves
+- Creates the brand-new transaction log, resolving the broken `.ldf` from the power failure.
+- Rebuilds the corrupted non-clustered index `nc1` on system catalog table `sys.sysiscols` (`CHECKDB fixed 0 allocation errors and 1 consistency errors`).
+- Brings `[Corruption4]` back to **`ONLINE` / `MULTI_USER`** so `DBCC CHECKDB` runs cleanly with **0 errors**.
+
+#### Key Learnings & Intentional Traps
+- **INTENTIONAL TRAP (`REPAIR_REBUILD` Fails in `EMERGENCY` Mode!):**
+  Even though `DBCC CHECKDB` prints `repair_rebuild is the minimum repair level` for the `sys.sysiscols` error, running `DBCC CHECKDB (N'Corruption4', REPAIR_REBUILD)` while in `EMERGENCY` mode fails with:
+  > **`Msg 7901: The repair statement was not processed. This level of repair is not supported when the database is in emergency mode.`**
+  Why? Because rebuilding a missing/corrupt transaction log breaks transactional ACID guarantees for any uncommitted transactions at the time of the power failure, so SQL Server **requires `REPAIR_ALLOW_DATA_LOSS`** to rebuild the log!
+- **Post-Recovery Best Practice:** Immediately take a **new Full Backup** (`BACKUP DATABASE [Corruption4] ...`) after using `REPAIR_ALLOW_DATA_LOSS`, because any previous backup/log chain is permanently broken (`Warning: The log for database 'Corruption4' has been rebuilt. Transactional consistency has been lost.`).
+
+---
+
+## Part 5: `MS SQL Server DatabaseMail Configuration` (`DatabaseMail.papercut.SMTP` + Agent Mail)
+
+Before SQL Server Agent jobs can send email alerts in Part 6, you need a working local SMTP server, Database Mail configured on your SQL Server instance, and SQL Server Agent linked to that Database Mail profile.
 
 ### Step 5.1 — Install Papercut SMTP, Configure Firewall & Verify in PowerShell
 **Task:**
@@ -782,17 +1136,23 @@ Before SQL Server Agent jobs can send email alerts in Part 6, you need a working
    - Website: `https://www.papercut-smtp.com/`
    - Direct installer: `https://github.com/ChangemakerStudios/Papercut-SMTP/releases/latest/download/PapercutSMTP-win-x64-stable-Setup.exe`
    ```powershell
-   Invoke-WebRequest -Uri "https://github.com/ChangemakerStudios/Papercut-SMTP/releases/latest/download/PapercutSMTP-win-x64-stable-Setup.exe" -OutFile "$env:TEMP\PapercutSMTP-Setup.exe"
-   Start-Process "$env:TEMP\PapercutSMTP-Setup.exe" -Wait
+   $InstallerPath = "$env:TEMP\PapercutSMTP-win-x64-stable-Setup.exe"
+   Invoke-WebRequest -Uri "https://github.com/ChangemakerStudios/Papercut-SMTP/releases/latest/download/PapercutSMTP-win-x64-stable-Setup.exe" -OutFile $InstallerPath
+   Start-Process -FilePath $InstallerPath -Wait
    ```
 2. **Launch Papercut SMTP & Configure Windows Firewall:**
    - When Windows Defender Firewall prompts on first launch:
      - **Check** `Private networks, such as my home or work network`
      - **Uncheck** `Public networks, such as those in airports and coffee shops`
-   - Confirm Papercut is listening on `127.0.0.1:25` (default).
+   - Confirm Papercut is listening on `127.0.0.1:25` (default) and verify in PowerShell that no `Public` inbound allow rule exists:
+     ```powershell
+     Get-NetFirewallApplicationFilter -Program "*Papercut*" |
+         Get-NetFirewallRule |
+         Select-Object DisplayName, Enabled, Direction, Action, Profile
+     ```
 3. **Verify SMTP functionality in PowerShell:**
    ```powershell
-   Send-MailMessage -SmtpServer localhost -Port 25 -From "test@localhost.localdomain" -To "anyone@anywhere.example" -Subject "Hello from Papercut!" -Body "SMTP works!"
+   Send-MailMessage -SmtpServer localhost -Port 25 -From "test@local" -To "anyone@anywhere.example" -Subject "Hello from Papercut!" -Body "It works!"
    ```
    Open the **Papercut SMTP** window and confirm `"Hello from Papercut!"` appears in the inbox.
 
@@ -800,15 +1160,18 @@ Before SQL Server Agent jobs can send email alerts in Part 6, you need a working
 Provides a safe, zero-cost local SMTP sink on port `25` that catches every email sent by PowerShell and SQL Server Database Mail without needing external internet relay credentials or spamming real inboxes.
 
 #### Key Learnings
-- Restricting Papercut to **Private networks** prevents machines on untrusted Public networks (e.g., café/guest Wi-Fi) from connecting to your local port `25` SMTP listener.
-- PowerShell's `Send-MailMessage` is marked obsolete in newer .NET versions (and emits a warning), which is harmless for a quick lab test, though production scripts should use `MailKit` or authenticated REST APIs.
+- Restricting Papercut to **Private networks** prevents machines on untrusted Public networks (e.g., café/campus Wi-Fi) from connecting to your local port `25` SMTP listener.
+- PowerShell's `Send-MailMessage` prints a deprecation warning in newer .NET versions, which is harmless for a local lab test (production scripts should use `MailKit` or authenticated APIs).
 
 ---
 
 ### Step 5.2 — Configure SQL Server Database Mail & SQL Agent Mail (T-SQL)
-**Task:** Configure SQL Server Database Mail and link it to SQL Server Agent so jobs and T-SQL scripts can send HTML notifications through Papercut SMTP.
+**Task:** Configure SQL Server Database Mail, link it to SQL Server Agent, create a DBA Operator, and verify mail delivery (`test@local.local` and formatted HTML email) through Papercut SMTP.
+
+*(Aligned with your existing `Papercut_Local_Account` and `Papercut_Local_Profile` from Nov 13—safe and idempotent to re-run!)*
 
 #### How to do it
+**Option A: Using T-SQL (Recommended)**
 ```sql
 USE [master];
 GO
@@ -820,68 +1183,84 @@ EXEC sp_configure N'Database Mail XPs', 1;
 RECONFIGURE;
 GO
 
+-- 2. Ensure Service Broker is enabled in msdb (required for Database Mail queue)
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = N'msdb' AND is_broker_enabled = 0)
+BEGIN
+    ALTER DATABASE [msdb] SET ENABLE_BROKER WITH ROLLBACK IMMEDIATE;
+END
+GO
+
 USE [msdb];
 GO
 
--- 2. Create a Database Mail Profile
-IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile WHERE name = N'DBA_Notifications')
+-- 3. Ensure a Database Mail Account exists pointing to local Papercut SMTP (port 25)
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_account WHERE name = N'Papercut_Local_Account')
+BEGIN
+    EXEC msdb.dbo.sysmail_add_account_sp
+        @account_name            = N'Papercut_Local_Account',
+        @description             = N'Local Papercut SMTP server account for lab testing',
+        @email_address           = N'sqlserver@local.local',
+        @display_name            = N'SQL Server Alerting (EXO)',
+        @replyto_address         = N'sqlserver@local.local',
+        @mailserver_name         = N'127.0.0.1',
+        @port                    = 25,
+        @use_default_credentials = 0,
+        @enable_ssl              = 0;
+END
+GO
+
+-- 4. Ensure the Database Mail Profile exists
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profile WHERE name = N'Papercut_Local_Profile')
 BEGIN
     EXEC msdb.dbo.sysmail_add_profile_sp
-        @profile_name = N'DBA_Notifications',
+        @profile_name = N'Papercut_Local_Profile',
         @description  = N'Profile for SQL Server DBA alerts and notifications via local Papercut SMTP.';
 END
 GO
 
--- 3. Create a Database Mail Account pointing to local Papercut SMTP (localhost:25)
-IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysmail_account WHERE name = N'Local_Papercut_SMTP')
-BEGIN
-    EXEC msdb.dbo.sysmail_add_account_sp
-        @account_name    = N'Local_Papercut_SMTP',
-        @description     = N'Local Papercut SMTP relay on port 25.',
-        @email_address   = N'sqlserver@localhost.localdomain',
-        @display_name    = N'SQL Server Alerting (EXO)',
-        @replyto_address = N'dba@localhost.localdomain',
-        @mailserver_name = N'127.0.0.1',
-        @port            = 25,
-        @enable_ssl      = 0;
-END
-GO
-
--- 4. Link the Account to the Profile (sequence_number = 1)
+-- 5. Link the Account to the Profile (sequence_number = 1)
 IF NOT EXISTS (
     SELECT 1
     FROM msdb.dbo.sysmail_profileaccount pa
     JOIN msdb.dbo.sysmail_profile p ON pa.profile_id = p.profile_id
     JOIN msdb.dbo.sysmail_account a ON pa.account_id = a.account_id
-    WHERE p.name = N'DBA_Notifications' AND a.name = N'Local_Papercut_SMTP'
+    WHERE p.name = N'Papercut_Local_Profile'
+      AND a.name = N'Papercut_Local_Account'
 )
 BEGIN
     EXEC msdb.dbo.sysmail_add_profileaccount_sp
-        @profile_name    = N'DBA_Notifications',
-        @account_name    = N'Local_Papercut_SMTP',
+        @profile_name    = N'Papercut_Local_Profile',
+        @account_name    = N'Papercut_Local_Account',
         @sequence_number = 1;
 END
 GO
 
--- 5. Grant public access & set as the default Database Mail profile
+-- 6. Grant public access & set as default only if no public default profile already exists
 IF NOT EXISTS (
     SELECT 1
     FROM msdb.dbo.sysmail_principalprofile pp
     JOIN msdb.dbo.sysmail_profile p ON pp.profile_id = p.profile_id
-    WHERE p.name = N'DBA_Notifications' AND pp.principal_sid = 0x00
+    WHERE p.name = N'Papercut_Local_Profile'
+      AND pp.principal_sid = 0x00
 )
 BEGIN
+    DECLARE @HasDefault BIT = CASE
+        WHEN EXISTS (SELECT 1 FROM msdb.dbo.sysmail_principalprofile WHERE principal_sid = 0x00 AND is_default = 1)
+            THEN 0
+        ELSE 1
+    END;
+
     EXEC msdb.dbo.sysmail_add_principalprofile_sp
-        @profile_name   = N'DBA_Notifications',
+        @profile_name   = N'Papercut_Local_Profile',
         @principal_name = N'public',
-        @is_default     = 1;
+        @is_default     = @HasDefault;
 END
 GO
 
--- 6. Configure SQL Server Agent to use Database Mail & create a DBA Operator
+-- 7. Configure SQL Server Agent to use Database Mail & create a DBA Operator
 EXEC msdb.dbo.sp_set_sqlagent_properties
     @email_save_in_sent_folder = 1,
-    @databasemail_profile      = N'DBA_Notifications',
+    @databasemail_profile      = N'Papercut_Local_Profile',
     @use_databasemail          = 1;
 GO
 
@@ -894,18 +1273,18 @@ BEGIN
 END
 GO
 
--- 7. Test Database Mail with a formatted HTML email
+-- 8. Test Database Mail with a formatted HTML email (to test@local.local)
 EXEC msdb.dbo.sp_send_dbmail
-    @profile_name = N'DBA_Notifications',
-    @recipients   = N'dba@anywhere.example',
-    @subject      = N'SQL Server Database Mail Test',
-    @body         = N'<h3>Database Mail is working!</h3><p>Sent from <b>SQL Server</b> to Papercut SMTP.</p>',
+    @profile_name = N'Papercut_Local_Profile',
+    @recipients   = N'test@local.local',
+    @subject      = N'SQL Server Database Mail & Agent Test',
+    @body         = N'<h3>Database Mail is working!</h3><p>Sent from <b>SQL Server (EXOPI-908\EXO)</b> to Papercut SMTP.</p>',
     @body_format  = N'HTML';
 GO
 
--- 8. Verify delivery status in msdb (wait a few seconds for Service Broker queue)
+-- 9. Verify delivery status in msdb (wait a few seconds for Service Broker queue)
 WAITFOR DELAY '00:00:05';
-SELECT mailitem_id, recipients, subject, sent_status, sent_date
+SELECT TOP (5) mailitem_id, recipients, subject, sent_status, sent_date
 FROM msdb.dbo.sysmail_allitems
 ORDER BY mailitem_id DESC;
 
@@ -915,15 +1294,29 @@ ORDER BY log_id DESC;
 GO
 ```
 
-*(Note: After setting `@use_databasemail = 1` on SQL Server Agent, **restart the SQL Server Agent service** — `SQLAgent$EXO` on `EXOPI-908\EXO` — e.g. `Restart-Service 'SQLAgent$EXO'` in an elevated PowerShell window or via SSMS/Configuration Manager, so Agent picks up the new mail profile for job-level notifications.)*
+*(Note: After setting `@use_databasemail = 1` on SQL Server Agent, **restart the SQL Server Agent service** — `SQLAgent$EXO` on `EXOPI-908\EXO` — e.g. `Restart-Service 'SQLAgent$EXO'` in an elevated PowerShell window or via SSMS Object Explorer -> Right-click **SQL Server Agent** -> **Restart**, so Agent picks up the new mail profile for job-level notifications.)*
+
+**Option B: Using SSMS GUI (Alternative)**
+1. In Object Explorer, expand **Management** $\rightarrow$ right-click **Database Mail** $\rightarrow$ **Configure Database Mail**.
+2. Select **Set up Database Mail by performing the following tasks** $\rightarrow$ **Next**.
+3. If prompted that the Database Mail feature is not available, click **Yes** to enable it.
+4. Enter Profile name **`Papercut_Local_Profile`** $\rightarrow$ click **Add...** to create a new SMTP Account:
+   - Account name: `Papercut_Local_Account`
+   - E-mail address: `sqlserver@local.local`
+   - Server name: `127.0.0.1` (or `localhost`) | Port number: `25`
+   - Leave **This server requires a secure connection (SSL)** unchecked and select **Anonymous authentication** $\rightarrow$ **OK** $\rightarrow$ **Next**.
+5. Under **Manage Profile Security**, check **Public** and set **Default Profile** = **Yes** $\rightarrow$ **Next** $\rightarrow$ **Next** $\rightarrow$ **Finish**.
+6. Right-click **SQL Server Agent** $\rightarrow$ **Properties** $\rightarrow$ **Alert System** $\rightarrow$ check **Enable mail profile**, select **Database Mail** and **`Papercut_Local_Profile`**, click **OK**, and **Restart** SQL Server Agent.
 
 #### What it achieves
-Enables SQL Server's asynchronous Service Broker-backed mail subsystem (`DatabaseMail.exe`) and registers `DBA_Notifications` as the default mail profile for `sp_send_dbmail` and SQL Server Agent.
+Enables SQL Server's asynchronous Service Broker-backed mail subsystem (`DatabaseMail.exe`), registers `Papercut_Local_Profile` as the default public mail profile, and links SQL Server Agent so jobs and alerts can send notifications through Papercut SMTP.
 
 #### Key Learnings & Traps
-- **Trap 1 (`Database Mail XPs` disabled by default):** SQL Server disables Database Mail out of the box for attack-surface reduction. Calling `sp_send_dbmail` before enabling `Database Mail XPs` raises Msg 15281 (*"SQL Server blocked access to procedure 'dbo.sp_send_dbmail'..."*).
-- **Trap 2 (Asynchronous Delivery):** `sp_send_dbmail` returns immediately (`Mail (Id: 1) queued.`) even if SMTP is down! Always inspect `msdb.dbo.sysmail_allitems` (`sent_status`: `sent`, `unsent`, `retrying`, `failed`) and `msdb.dbo.sysmail_event_log` when troubleshooting.
-- **Trap 3 (`127.0.0.1` vs `localhost`):** Using `127.0.0.1` avoids IPv6 `::1` resolution mismatches if Papercut is only bound to IPv4 loopback.
+- **Trap 1 (`Database Mail XPs` disabled by default):** SQL Server disables Database Mail out of the box for attack-surface reduction. Calling `sp_send_dbmail` before enabling `Database Mail XPs` raises **Msg 15281** (*"SQL Server blocked access to procedure 'dbo.sp_send_dbmail'..."*).
+- **Trap 2 (Asynchronous Delivery):** `sp_send_dbmail` returns immediately (`Mail (Id: ...) queued.`) even if SMTP is down! Always inspect `msdb.dbo.sysmail_allitems` (`sent_status`: `sent`, `unsent`, `retrying`, `failed`) and `msdb.dbo.sysmail_event_log` when troubleshooting.
+- **Trap 3 (SSL & Authentication with Papercut):** Papercut runs unencrypted on port `25` with anonymous authentication. Enabling SSL (`@enable_ssl = 1`) or passing Windows credentials causes delivery to fail.
+- **Trap 4 (`127.0.0.1` vs `localhost`):** Using `127.0.0.1` avoids IPv6 `::1` resolution mismatches if Papercut is only bound to IPv4 loopback.
+- **Trap 5 (One Default Profile Per Principal):** Calling `sysmail_add_principalprofile_sp` with `@is_default = 1` for `public` fails if another profile is already marked as the `public` default (`sysmail_principalprofile`). Always check before setting `@is_default = 1`.
 
 ---
 
@@ -1038,9 +1431,9 @@ BEGIN
                 THEN CONCAT([File], N'':'', [Page])
                 ELSE N''-''
             END,
-            MessageText
+            ISNULL(MessageText, N''-'')
         FROM #CheckDBResults
-        WHERE [Level] >= 11 OR MessageText LIKE N''%corrupt%'' OR MessageText LIKE N''%consistency error%'';
+        WHERE Error > 0 OR [Level] >= 11 OR MessageText LIKE N''%corrupt%'' OR MessageText LIKE N''%consistency error%'';
     END TRY
     BEGIN CATCH
         INSERT INTO #AllCorruption (DatabaseName, Error, [Level], [State], RepairLevel, FilePage, MessageText)
@@ -1051,7 +1444,7 @@ BEGIN
             ERROR_STATE(),
             N''Check Failed'',
             N''-'',
-            ERROR_MESSAGE()
+            ISNULL(ERROR_MESSAGE(), N''Unknown error'')
         );
     END CATCH
 
@@ -1068,7 +1461,7 @@ BEGIN
     DECLARE @HtmlBody  NVARCHAR(MAX);
     DECLARE @Subject   NVARCHAR(255) = N''[CRITICAL] DBCC CHECKDB Corruption Detected on '' + @@SERVERNAME;
 
-    SELECT @TableRows = (
+    SELECT @TableRows = CAST((
         SELECT
             td = DatabaseName,                                    N'''',
             td = CAST(Error AS NVARCHAR(20)),                     N'''',
@@ -1079,7 +1472,7 @@ BEGIN
         FROM #AllCorruption
         ORDER BY DatabaseName, [Level] DESC, Error
         FOR XML PATH(''tr''), TYPE
-    ).value(''.'', ''NVARCHAR(MAX)'');
+    ) AS NVARCHAR(MAX));
 
     SET @HtmlBody = N''
     <html>
@@ -1120,12 +1513,12 @@ BEGIN
     </html>'';
 
     EXEC msdb.dbo.sp_send_dbmail
-        @profile_name = N'DBA_Notifications',
-        @recipients   = N'dba@anywhere.example',
+        @profile_name = N''Papercut_Local_Profile'',
+        @recipients   = N''dba@anywhere.example'',
         @subject      = @Subject,
         @body         = @HtmlBody,
-        @body_format  = N'HTML',
-        @importance   = N'HIGH';
+        @body_format  = N''HTML'',
+        @importance   = N''HIGH'';
 END
 ';
 GO
@@ -1278,18 +1671,20 @@ SELECT
         WHEN 46 THEN N''CREATED''
         WHEN 47 THEN N''DELETED''
     END AS Operation,
-    t.DatabaseName,
-    t.LoginName        AS EffectiveLogin,
-    t.SessionLoginName AS OriginalLogin,
-    ISNULL(t.HostName, N''-'')        AS HostName,
-    ISNULL(t.ApplicationName, N''-'') AS ApplicationName,
+    COALESCE(t.DatabaseName, t.ObjectName, N''-'') AS DatabaseName,
+    ISNULL(t.LoginName, N''-'')                    AS EffectiveLogin,
+    ISNULL(t.SessionLoginName, N''-'')             AS OriginalLogin,
+    ISNULL(t.HostName, N''-'')                     AS HostName,
+    ISNULL(t.ApplicationName, N''-'')              AS ApplicationName,
     t.StartTime
 INTO #DbEvents
 FROM sys.fn_trace_gettable(@TracePath, DEFAULT) t
 WHERE t.EventClass IN (46, 47)   -- 46 = Object:Created, 47 = Object:Deleted
   AND t.ObjectType = 16964       -- 16964 = Database
   AND t.EventSubClass = 1        -- 1 = Commit (avoids duplicate Begin/Commit rows)
-  AND t.DatabaseName <> N''tempdb''
+  AND ISNULL(t.IsSystem, 0) = 0  -- Ignore internal system/DBCC snapshot events
+  AND COALESCE(t.DatabaseName, t.ObjectName, N'''') <> N''tempdb''
+  AND COALESCE(t.DatabaseName, t.ObjectName, N'''') NOT LIKE N''%_MSSQL_DBCC%''
   AND t.StartTime > @LastChecked;
 
 IF EXISTS (SELECT 1 FROM #DbEvents)
@@ -1298,7 +1693,7 @@ BEGIN
     DECLARE @HtmlBody  NVARCHAR(MAX);
     DECLARE @Subject   NVARCHAR(255) = N''[SQL Audit] Database Create/Delete Detected on '' + @@SERVERNAME;
 
-    SELECT @TableRows = (
+    SELECT @TableRows = CAST((
         SELECT
             td = Operation,                                       N'''',
             td = DatabaseName,                                    N'''',
@@ -1310,7 +1705,7 @@ BEGIN
         FROM #DbEvents
         ORDER BY StartTime ASC
         FOR XML PATH(''tr''), TYPE
-    ).value(''.'', ''NVARCHAR(MAX)'');
+    ) AS NVARCHAR(MAX));
 
     SET @HtmlBody = N''
     <html>
@@ -1349,11 +1744,11 @@ BEGIN
     </html>'';
 
     EXEC msdb.dbo.sp_send_dbmail
-        @profile_name = N'DBA_Notifications',
-        @recipients   = N'dba@anywhere.example',
+        @profile_name = N''Papercut_Local_Profile'',
+        @recipients   = N''dba@anywhere.example'',
         @subject      = @Subject,
         @body         = @HtmlBody,
-        @body_format  = N'HTML';
+        @body_format  = N''HTML'';
 
     UPDATE msdb.dbo.DBA_TraceWatermark
     SET LastEventTime = (SELECT MAX(StartTime) FROM #DbEvents)
@@ -1395,12 +1790,12 @@ SELECT
         WHEN 4 THEN N''REVOKE DB ACCESS''
         ELSE CONCAT(N''SubClass '', t.EventSubClass)
     END AS Operation,
-    ISNULL(t.DatabaseName, N''-'')     AS DatabaseName,
-    ISNULL(t.TargetUserName, N''-'')   AS TargetDatabaseUser,
-    t.LoginName                        AS EffectiveLogin,
-    t.SessionLoginName                 AS OriginalLogin,
-    ISNULL(t.HostName, N''-'')         AS HostName,
-    ISNULL(t.ApplicationName, N''-'')  AS ApplicationName,
+    ISNULL(t.DatabaseName, N''-'')                         AS DatabaseName,
+    COALESCE(t.TargetUserName, t.TargetLoginName, N''-'')  AS TargetDatabaseUser,
+    ISNULL(t.LoginName, N''-'')                            AS EffectiveLogin,
+    ISNULL(t.SessionLoginName, N''-'')                     AS OriginalLogin,
+    ISNULL(t.HostName, N''-'')                             AS HostName,
+    ISNULL(t.ApplicationName, N''-'')                      AS ApplicationName,
     t.StartTime
 INTO #UserEvents
 FROM sys.fn_trace_gettable(@TracePath, DEFAULT) t
@@ -1414,7 +1809,7 @@ BEGIN
     DECLARE @HtmlBody  NVARCHAR(MAX);
     DECLARE @Subject   NVARCHAR(255) = N''[SQL Audit] Database User Create/Delete Detected on '' + @@SERVERNAME;
 
-    SELECT @TableRows = (
+    SELECT @TableRows = CAST((
         SELECT
             td = Operation,                                       N'''',
             td = DatabaseName,                                    N'''',
@@ -1427,7 +1822,7 @@ BEGIN
         FROM #UserEvents
         ORDER BY StartTime ASC
         FOR XML PATH(''tr''), TYPE
-    ).value(''.'', ''NVARCHAR(MAX)'');
+    ) AS NVARCHAR(MAX));
 
     SET @HtmlBody = N''
     <html>
@@ -1467,11 +1862,11 @@ BEGIN
     </html>'';
 
     EXEC msdb.dbo.sp_send_dbmail
-        @profile_name = N'DBA_Notifications',
-        @recipients   = N'dba@anywhere.example',
+        @profile_name = N''Papercut_Local_Profile'',
+        @recipients   = N''dba@anywhere.example'',
         @subject      = @Subject,
         @body         = @HtmlBody,
-        @body_format  = N'HTML';
+        @body_format  = N''HTML'';
 
     UPDATE msdb.dbo.DBA_TraceWatermark
     SET LastEventTime = (SELECT MAX(StartTime) FROM #UserEvents)
@@ -1662,7 +2057,7 @@ EXEC (@Sql);
 
 -- Loop through every table in @DatabaseName and evaluate temporal requirements
 DECLARE @CurrentRowID  INT = 1;
-DECLARE @MaxRowID      INT = (SELECT MAX(RowID) FROM #TableList);
+DECLARE @MaxRowID      INT = ISNULL((SELECT MAX(RowID) FROM #TableList), 0);
 DECLARE @SchemaName    SYSNAME;
 DECLARE @TableName     SYSNAME;
 DECLARE @HasPK         BIT;
