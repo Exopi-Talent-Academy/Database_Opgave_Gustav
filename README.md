@@ -2258,3 +2258,1543 @@ GO
 - **Trap (`DROP TABLE` Blocked):** While `SYSTEM_VERSIONING = ON`, SQL Server intentionally blocks `DROP TABLE SalesLT.Product`, `TRUNCATE TABLE SalesLT.Product`, and direct `INSERT/UPDATE/DELETE` on `SalesLT.ProductHistory`. To drop or alter a history table, you must first run `ALTER TABLE SalesLT.Product SET (SYSTEM_VERSIONING = OFF);`.
 - **UTC Timestamps:** `ValidFrom` and `ValidTo` always use **UTC** (`SYSUTCDATETIME()`), not local server time (`GETDATE()`). Keep this in mind when passing timestamps to `FOR SYSTEM_TIME AS OF`!
 
+---
+
+## Part 9: `TempDB` Architecture, Sizing, File Placement & Governance
+
+### Step 9.1 — Who Can Access the `TempDB` Database?
+**Question:** *Who can access the `TempDB` database?*
+
+- **Answer:** **Every authenticated login/user** that can connect to the SQL Server instance has access to `tempdb` (in addition to SQL Server's internal engine processes).
+- **Why:**
+  1. Unlike user databases (where the `guest` user is disabled by default), the **`guest` database user is enabled in `tempdb`** with `CONNECT` permission—and SQL Server prohibits disabling or revoking `guest` access in `tempdb`.
+  2. Every member of the **`public`** fixed database role can create local temporary tables (`#temp`), global temporary tables (`##global_temp`), and table variables (`@table`), and SQL Server automatically creates internal worktables, sort/hash spills, and row versions in `tempdb` on behalf of any session.
+- **Security & Isolation Boundary:**
+  - Local temporary tables (`#MyTemp`) are **session-scoped**—other users cannot read or alter your `#MyTemp` table even though both live in `tempdb`.
+  - Global temporary tables (`##MyGlobalTemp`) and permanent tables explicitly created inside `tempdb` (`CREATE TABLE tempdb.dbo.Shared ...`) are visible across sessions, and **everything in `tempdb` is wiped and recreated from `model` on every SQL Server restart**.
+
+---
+
+### Step 9.2 — Minimizing `TempDB` Dependency When Writing SQL Queries
+**Question:** *Your database users want to minimize the dependency on temporary storage (`TempDB`) when writing SQL queries. What advice would you give them?*
+
+Give developers and report writers the following practical T-SQL and indexing rules:
+1. **Create Covering & Appropriately Ordered Indexes (and Keep Statistics Up to Date):**
+   - Missing indexes or stale statistics cause SQL Server to underestimate row counts, allocate too-small RAM memory grants, and **spill large `SORT` and `HASH MATCH` operators onto `tempdb` disk**. Proper composite indexes (`CREATE INDEX ... INCLUDE (...)`) satisfy `WHERE`, `JOIN`, and `ORDER BY` in memory without spilling.
+2. **Avoid `SELECT *` and Unnecessary Wide / `MAX` Columns:**
+   - Selecting unused columns—especially `VARCHAR(MAX)`, `NVARCHAR(MAX)`, or `VARBINARY(MAX)`—inflates estimated row width, exhausts memory grants, and forces spills into `tempdb`.
+3. **Avoid Unnecessary `ORDER BY`, `DISTINCT`, `GROUP BY`, and `UNION`:**
+   - Use **`UNION ALL`** instead of `UNION` whenever duplicate elimination is not required (`UNION` forces an expensive `Sort` / `Hash Aggregate` in `tempdb`).
+   - Do not add `ORDER BY` inside subqueries, views, or intermediate CTEs, and avoid `DISTINCT` as a "lazy fix" for poorly written joins.
+4. **Write SARGable `WHERE` Predicates:**
+   - Avoid wrapping indexed columns in functions (e.g., `WHERE YEAR(OrderDate) = 2026` or `WHERE LEFT(Name, 3) = 'ABC'`), which prevents Index Seeks and forces full scans + temp sorts/hashes. Use range predicates (`OrderDate >= '2026-01-01' AND OrderDate < '2027-01-01'`) instead.
+5. **Keep Transactions Short When Using `RCSI` / `SNAPSHOT` Isolation or Triggers:**
+   - Long-running open transactions prevent SQL Server's **Version Store** cleanup thread in `tempdb` from purging old row versions, causing `tempdb` to bloat even when the session itself isn't creating `#temp` tables.
+6. **Avoid `STATIC` / `KEYSET` Cursors and Excessively Large `#temp` Tables or `@table` Variables:**
+   - `STATIC` and `KEYSET` cursors materialize full result sets in `tempdb`. Replace cursors with set-based T-SQL (or, if unavoidable, use `LOCAL FAST_FORWARD`).
+   - Only materialize intermediate `#temp` tables when genuinely needed to simplify a complex multi-join plan—and never dump millions of unfiltered rows into `#temp` or `@table` variables before filtering.
+7. **Batch Large DML Operations & `SELECT ... INTO`:**
+   - Updating/deleting millions of rows in one giant transaction can spill sort/spool worktables and bloat the version store. Process in smaller chunks (e.g., `10,000`–`50,000` rows per batch).
+
+---
+
+### Step 9.3 — Set a Max `TempDB` Size on Your SQL Instance
+**Task:** *Set a max `TempDB` size on your SQL instance.*
+
+#### How to do it
+First inspect the current `tempdb` file configuration in `sys.master_files` (`max_size = -1` means **Unlimited**, which risks filling the OS `C:` drive!):
+
+```sql
+USE [master];
+GO
+
+-- 1. Inspect current TempDB files, sizes, max_size, and autogrowth
+SELECT
+    file_id,
+    name AS LogicalName,
+    type_desc AS FileType,
+    physical_name AS PhysicalPath,
+    CAST(size * 8.0 / 1024.0 AS DECIMAL(10, 2)) AS CurrentSizeMB,
+    CASE max_size
+        WHEN -1 THEN N'Unlimited'
+        ELSE CAST(CAST(max_size * 8.0 / 1024.0 AS DECIMAL(10, 2)) AS NVARCHAR(30)) + N' MB'
+    END AS MaxSize,
+    CASE
+        WHEN is_percent_growth = 1 THEN CAST(growth AS NVARCHAR(10)) + N'%'
+        ELSE CAST(CAST(growth * 8.0 / 1024.0 AS DECIMAL(10, 2)) AS NVARCHAR(20)) + N' MB'
+    END AS AutoGrowth
+FROM sys.master_files
+WHERE database_id = DB_ID(N'tempdb')
+ORDER BY file_id;
+GO
+```
+
+Now run this dynamic script to apply a **fixed `MAXSIZE` and predictable fixed-MB `FILEGROWTH`** to every `tempdb` data and log file (e.g., `1024 MB` max per data file and `512 MB` max for `templog`—adjust `@MaxDataFileMB` / `@MaxLogFileMB` to fit your disk capacity):
+
+```sql
+USE [master];
+GO
+
+SET NOCOUNT ON;
+
+-- Adjust limits to suit your lab/production drive capacity
+DECLARE @MaxDataFileMB INT = 1024; -- Max size per TempDB data file (.mdf/.ndf)
+DECLARE @MaxLogFileMB  INT = 512;  -- Max size for TempDB log file (.ldf)
+DECLARE @GrowthMB      INT = 64;   -- Fixed MB growth (avoid percentage growth!)
+
+DECLARE @LogicalName SYSNAME;
+DECLARE @FileType    TINYINT;
+DECLARE @CurrentMB   INT;
+DECLARE @TargetMaxMB INT;
+DECLARE @Sql         NVARCHAR(MAX);
+
+DECLARE TempFileCursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT
+        name,
+        [type],
+        CEILING(size * 8.0 / 1024.0)
+    FROM sys.master_files
+    WHERE database_id = DB_ID(N'tempdb');
+
+OPEN TempFileCursor;
+FETCH NEXT FROM TempFileCursor INTO @LogicalName, @FileType, @CurrentMB;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @TargetMaxMB = CASE WHEN @FileType = 1 THEN @MaxLogFileMB ELSE @MaxDataFileMB END;
+
+    -- Ensure MAXSIZE is never lower than the file's current allocated size
+    IF @CurrentMB > @TargetMaxMB
+        SET @TargetMaxMB = @CurrentMB;
+
+    SET @Sql = N'ALTER DATABASE [tempdb] MODIFY FILE (' +
+               N'NAME = N''' + REPLACE(@LogicalName, N'''', N'''''') + N''', ' +
+               N'MAXSIZE = ' + CAST(@TargetMaxMB AS NVARCHAR(20)) + N'MB, ' +
+               N'FILEGROWTH = ' + CAST(@GrowthMB AS NVARCHAR(20)) + N'MB);';
+
+    PRINT @Sql;
+    EXEC (@Sql);
+
+    FETCH NEXT FROM TempFileCursor INTO @LogicalName, @FileType, @CurrentMB;
+END
+
+CLOSE TempFileCursor;
+DEALLOCATE TempFileCursor;
+GO
+
+-- Verify updated MAXSIZE in sys.master_files
+SELECT
+    file_id,
+    name AS LogicalName,
+    type_desc AS FileType,
+    CAST(size * 8.0 / 1024.0 AS DECIMAL(10, 2)) AS CurrentSizeMB,
+    CAST(max_size * 8.0 / 1024.0 AS DECIMAL(10, 2)) AS MaxSizeMB,
+    CAST(growth * 8.0 / 1024.0 AS DECIMAL(10, 2)) AS GrowthMB
+FROM sys.master_files
+WHERE database_id = DB_ID(N'tempdb')
+ORDER BY file_id;
+GO
+```
+
+#### What it achieves
+Replaces SQL Server's dangerous default `Unlimited` (`max_size = -1`) setting with explicit upper bounds (`MAXSIZE`) and uniform `64 MB` fixed-size autogrowth so a runaway query in `tempdb` cannot fill the entire `C:` volume and crash Windows or other databases.
+
+#### Key Learnings
+- `sys.master_files` reports `size`, `max_size`, and non-percent `growth` in **8 KB pages** (`pages * 8.0 / 1024.0 = MB`).
+- Always use **fixed MB `FILEGROWTH`** (not `%` growth) on `tempdb` and keep `SIZE`, `MAXSIZE`, and `FILEGROWTH` identical across all `tempdb` data files so SQL Server's proportional-fill algorithm stays balanced.
+
+---
+
+### Step 9.4 — Move Your Physical `TempDB` Files to `C:\Exo\Database\TempDB`
+**Task:** *Move your physical `TempDB` files to the location `C:\Exo\Database\TempDB`.*
+
+#### How to do it
+1. **Create `C:\Exo\Database\TempDB` via T-SQL** (using `xp_create_subdir` guarantees `NT SERVICE\MSSQL$EXO` has NTFS permissions on the new folder):
+   ```sql
+   USE [master];
+   GO
+   EXEC master.dbo.xp_create_subdir N'C:\Exo\Database\TempDB';
+   GO
+   ```
+   *(If you create the folder in File Explorer/PowerShell instead, ensure `NT SERVICE\MSSQL$EXO` has Full Control on `C:\Exo\Database\TempDB` before restarting SQL Server!)*
+
+2. **Update every `tempdb` file path in `master` (`ALTER DATABASE [tempdb] MODIFY FILE`) dynamically** (handles both `tempdev`/`templog` and any extra `temp2`..`temp8` data files created by SQL Server 2025 Setup):
+   ```sql
+   USE [master];
+   GO
+
+   SET NOCOUNT ON;
+
+   DECLARE @TargetFolder NVARCHAR(260) = N'C:\Exo\Database\TempDB\';
+   DECLARE @LogicalName  SYSNAME;
+   DECLARE @OldPath      NVARCHAR(260);
+   DECLARE @FileNameOnly NVARCHAR(260);
+   DECLARE @NewPath      NVARCHAR(260);
+   DECLARE @Sql          NVARCHAR(MAX);
+
+   DECLARE MoveCursor CURSOR LOCAL FAST_FORWARD FOR
+       SELECT name, physical_name
+       FROM sys.master_files
+       WHERE database_id = DB_ID(N'tempdb');
+
+   OPEN MoveCursor;
+   FETCH NEXT FROM MoveCursor INTO @LogicalName, @OldPath;
+
+   WHILE @@FETCH_STATUS = 0
+   BEGIN
+       -- Extract just the filename (e.g., tempdb.mdf, tempdb_mssql_2.ndf, templog.ldf)
+       SET @FileNameOnly = RIGHT(@OldPath, CHARINDEX(N'\', REVERSE(@OldPath)) - 1);
+       SET @NewPath      = @TargetFolder + @FileNameOnly;
+
+       SET @Sql = N'ALTER DATABASE [tempdb] MODIFY FILE (' +
+                  N'NAME = N''' + REPLACE(@LogicalName, N'''', N'''''') + N''', ' +
+                  N'FILENAME = N''' + REPLACE(@NewPath, N'''', N'''''') + N''');';
+
+       PRINT @Sql;
+       EXEC (@Sql);
+
+       FETCH NEXT FROM MoveCursor INTO @LogicalName, @OldPath;
+   END
+
+   CLOSE MoveCursor;
+   DEALLOCATE MoveCursor;
+   GO
+   ```
+
+3. **Restart the SQL Server service (`MSSQL$EXO`)** so `tempdb` is recreated at the new location:
+   - In SSMS Object Explorer: right-click **`EXOPI-908\EXO`** $\rightarrow$ **Restart** (also restarts `SQLAgent$EXO` if prompted).
+   - Or in an elevated PowerShell window:
+     ```powershell
+     Restart-Service 'MSSQL$EXO' -Force
+     Start-Service 'SQLAgent$EXO'
+     ```
+
+4. **Verify active `tempdb` file locations** in both `sys.master_files` and `tempdb.sys.database_files`:
+   ```sql
+   SELECT
+       mf.name AS LogicalName,
+       mf.physical_name AS ConfiguredCatalogPath,
+       df.physical_name AS ActiveTempDBPath,
+       CAST(df.size * 8.0 / 1024.0 AS DECIMAL(10, 2)) AS ActiveSizeMB
+   FROM sys.master_files mf
+   JOIN tempdb.sys.database_files df ON mf.file_id = df.file_id
+   WHERE mf.database_id = DB_ID(N'tempdb')
+   ORDER BY mf.file_id;
+   GO
+   ```
+   *(All paths should now show `C:\Exo\Database\TempDB\...`.)*
+
+5. **Clean up orphaned files from the old directory:**
+   SQL Server creates fresh `tempdb` files in `C:\Exo\Database\TempDB`, but **does not delete the old `tempdb*.mdf`/`*.ndf`/`templog.ldf` files** from `C:\Program Files\Microsoft SQL Server\MSSQL17.EXO\MSSQL\DATA\`. Once verified active in the new folder, you can safely delete the old files from the old `DATA` folder.
+
+#### What it achieves
+Relocates all `tempdb` physical data and log files into `C:\Exo\Database\TempDB` cleanly without losing configuration.
+
+#### Key Learnings & Intentional Traps
+- **Trap 1 (Service Restart Required):** `ALTER DATABASE [tempdb] MODIFY FILE` only updates `master`'s catalog (`sys.master_files`). `tempdb.sys.database_files` continues pointing to the old files until SQL Server restarts and recreates `tempdb`.
+- **Trap 2 (Typos or Missing Permissions = Failed Startup!):** If `C:\Exo\Database\TempDB` does not exist or `NT SERVICE\MSSQL$EXO` lacks Modify/Full Control NTFS permissions, the SQL Server service will **fail to start** after the restart! Always verify folder creation and permissions *before* restarting.
+
+---
+
+### Step 9.5 — Multiple `TempDB` Files & Using `TempDB` to Speed Up Queries
+**Questions:**
+1. *What is the purpose of having multiple physical `TempDB` files?*
+   - **Eliminates Allocation Page Latch Contention (`PFS`, `GAM`, `SGAM`):** When many concurrent sessions rapidly create, populate, and drop `#temp` tables, every allocation updates internal bitmap pages (**PFS** = Page Free Space, **GAM** = Global Allocation Map, **SGAM** = Shared Global Allocation Map). With only a single data file, threads queue up waiting on exclusive memory latches (`PAGELATCH_UP` / `PAGELATCH_EX` on pages `2:1:1`, `2:1:2`, `2:1:3`).
+   - **Proportional Fill & Parallel I/O:** Creating multiple **equally sized** data files (Microsoft Setup defaults to 1 file per logical CPU up to **8 files**) gives SQL Server multiple allocation bitmaps and distributes page allocations round-robin across all files, maximizing throughput.
+   - *(Note: Since SQL Server 2016+, trace flags `1117` [grow all files equally] and `1118` [uniform extents] are built-in defaults for `tempdb`, and SQL Server 2019–2025 further reduced `PFS`/`GAM`/`SGAM` contention, but multiple equal-sized files remain essential for scalable concurrency.)*
+
+2. *If you have a resource-intensive SQL Server database, how can you use `TempDB` to make queries run faster?*
+   - **Place `tempdb` on Fast Dedicated Storage (NVMe / PCIe SSD):** Isolates heavy spills, worktables, and `#temp` I/O from user database `.mdf`/`.ldf` storage so they don't compete for disk queue depth.
+   - **Pre-Size Equal `tempdb` Data Files + Enable Instant File Initialization (IFI):** Prevents query stalls caused by synchronous file autogrowth and zero-initialization during workload spikes.
+   - **Enable Memory-Optimized `TempDB` Metadata (`TEMPDB_METADATA_MEMORY_OPTIMIZED = ON`):** Available in SQL Server 2019–2025 Enterprise/Developer/Standard, moves `tempdb` system catalog metadata (`sys.sysobjvalues`, `sys.syscolpars`, etc.) into lock-free In-Memory OLTP tables, eliminating metadata latch bottlenecks under extreme `#temp` table churn (requires restart).
+   - **Use `SORT_IN_TEMPDB = ON` During Index Builds/Rebuilds:** Offloads intermediate index sort runs from the user database's filegroup and transaction log into `tempdb`, which speeds up index maintenance and keeps user database log growth smaller.
+   - **Break Up Monster Queries with Indexed `#temp` Tables:** Materializing a selective intermediate result set into a `#temp` table (and adding a `PRIMARY KEY` or non-clustered index on the join key) gives the Query Optimizer exact row-count statistics (`100%` accurate cardinality) instead of guessing poorly across 8–12 nested joins/CTEs.
+   - **Enable `READ_COMMITTED_SNAPSHOT` (RCSI) on the User Database:** Uses the `tempdb` row version store so `SELECT` readers never block `UPDATE`/`DELETE` writers (and vice versa), dramatically speeding up mixed OLTP + reporting workloads.
+
+---
+
+### Step 9.6 — What Happens to Ongoing Transactions If `TempDB` Reaches `MaxSize`?
+**Question:** *What happens to ongoing database transactions if you reach Max `TempDB` file size?*
+
+- **Any active query or transaction that needs to allocate new pages in `tempdb` fails immediately and rolls back:**
+  - If `tempdb` data files hit `MAXSIZE`: SQL Server raises **Error 1105** or **Error 1101** (*"Could not allocate space for object '...' in database 'tempdb' because the 'PRIMARY' filegroup is full."*).
+  - If `tempdb` log (`templog`) hits `MAXSIZE`: SQL Server raises **Error 9002** (*"The transaction log for database 'tempdb' is full due to 'ACTIVE_TRANSACTION'."*).
+- **Impact on other user database transactions:**
+  - User database queries that run **purely in memory** without sorting/hashing spills, `#temp` tables, cursors, triggers, or row versioning can continue.
+  - **However**, any user database write (`INSERT`/`UPDATE`/`DELETE`) on a database using **`SNAPSHOT` / `RCSI` isolation**, **triggers** (`inserted`/`deleted` tables), **MARS**, or **online index operations** also writes to `tempdb`—so those transactions **fail and roll back too**.
+  - Even SSMS UI operations, monitoring scripts, and `DBCC` commands can hang or fail until the space-consuming query aborts or a DBA kills the offending SPID (`KILL <spid>`), freeing its internal `tempdb` pages.
+
+---
+
+### Step 9.7 — Tools to Limit `TempDB` Space Consumption for a Specific User Group
+**Question:** *What tools do you have available to limit `TempDB` space consumption for a specific user group?*
+
+Because you are running **SQL Server 2025 (`17.x`) Enterprise Developer Edition**, you have **native per-group `tempdb` space quotas** in addition to classic governance controls:
+
+1. **SQL Server 2025 Resource Governor — Native `TempDB` Space Governance *(New in SQL Server 2025!)*:**
+   - Resource Governor now supports **`GROUP_MAX_TEMPDB_DATA_MB`** and **`GROUP_MAX_TEMPDB_DATA_PERCENT`** directly on `CREATE WORKLOAD GROUP` / `ALTER WORKLOAD GROUP`.
+   - Combine a **Classifier Function** (identifying the target user group, AD group `IS_MEMBER('DOMAIN\ReportingUsers')`, login, or application name) with a capped **Workload Group**.
+   - If sessions in that group collectively exceed the limit (`#temp` tables, `@table` variables, spills, worktables), SQL Server aborts only that group's offending query with **`Msg 1138`** (*"Could not allocate a new page for database 'tempdb' because that would exceed the limit set for workload group '...'"*)—protecting everyone else!
+   - *(Note: `GROUP_MAX_TEMPDB_DATA_MB` governs data space for user objects/worktables/spills, not `templog` or the shared global version store.)*
+
+   **Example Configuration (Capping a `ReportingUsers` Group to `256 MB` in `TempDB`):**
+   ```sql
+   USE [master];
+   GO
+
+   -- 1. Create a Workload Group with a strict 256 MB TempDB cap
+   IF NOT EXISTS (SELECT 1 FROM sys.resource_governor_workload_groups WHERE name = N'wg_Reporting_TempDBCapped')
+   BEGIN
+       CREATE WORKLOAD GROUP [wg_Reporting_TempDBCapped]
+       WITH (
+           GROUP_MAX_TEMPDB_DATA_MB = 256,
+           REQUEST_MAX_MEMORY_GRANT_PERCENT = 15,
+           MAX_DOP = 2
+       )
+       USING [default];
+   END
+   GO
+
+   -- 2. Create a Classifier Function mapping specific logins / AD groups to that Workload Group
+   CREATE OR ALTER FUNCTION dbo.fn_RG_Classifier()
+   RETURNS SYSNAME
+   WITH SCHEMABINDING
+   AS
+   BEGIN
+       DECLARE @GroupName SYSNAME = N'default';
+
+       IF SUSER_SNAME() IN (N'ReportUser', N'John')
+          OR IS_MEMBER(N'DOMAIN\ReportingUsers') = 1
+       BEGIN
+           SET @GroupName = N'wg_Reporting_TempDBCapped';
+       END
+
+       RETURN @GroupName;
+   END;
+   GO
+
+   -- 3. Register the Classifier Function and enable Resource Governor
+   ALTER RESOURCE GOVERNOR WITH (CLASSIFIER_FUNCTION = dbo.fn_RG_Classifier);
+   ALTER RESOURCE GOVERNOR RECONFIGURE;
+   GO
+
+   -- 4. Monitor TempDB usage & quota violations per Workload Group
+   SELECT
+       wg.group_id,
+       wg.name,
+       cfg.group_max_tempdb_data_mb,
+       CAST(wg.tempdb_data_space_kb / 1024.0 AS DECIMAL(10, 2)) AS CurrentTempDBUsedMB,
+       wg.total_tempdb_data_limit_violation_count AS ViolationCount
+   FROM sys.dm_resource_governor_workload_groups wg
+   JOIN sys.resource_governor_workload_groups cfg ON wg.group_id = cfg.group_id;
+   GO
+   ```
+
+2. **Classic Resource Governor Controls (Pre-2025 & Complementary Caps):**
+   - `REQUEST_MAX_MEMORY_GRANT_PERCENT` and `MAX_DOP` limit how aggressively a user group can run parallel sorts/hashes.
+   - `REQUEST_MAX_CPU_TIME_SEC` (for runaway queries).
+
+3. **Query Governor Cost Limit (`sp_configure 'query governor cost limit'` / `SET QUERY_GOVERNOR_COST_LIMIT`):**
+   - Prevents queries whose estimated execution cost exceeds a threshold from even starting (useful for blocking accidental Cartesian-product reporting queries before they spill to `tempdb`).
+
+4. **Automated DMV Watchdog Job (`sys.dm_db_session_space_usage` + `sys.dm_db_task_space_usage`):**
+   - A scheduled SQL Agent job (every 30–60 seconds) checks `tempdb` MB allocated per login/group; if a session in a restricted group exceeds a threshold, it logs the query, emails the DBA, and optionally runs `KILL <spid>`. *(Essential on Standard Edition or older SQL versions where Resource Governor isn't available or lacks `GROUP_MAX_TEMPDB_DATA_MB`.)*
+
+---
+
+## Part 10: IT-Revision Compliance Report — Unplanned Restarts & Recovery Time (12-Month Audit)
+
+### Step 10.1 — Where to Look & Default Setup Limitations
+**Assignment Questions:**
+- *The internal IT-revision wants a report that goes 12 months back.*
+- *The report must include how many times the SQL production instance was restarted outside the monthly service window, plus how long (seconds) it took before the user databases were online again.*
+- *Where would you look for this information?*
+- *Can you build such a report based on your default SQL Server setup?*
+
+#### 1. Where Would You Look for This Information?
+| Source | What It Contains | Retention on Default Setup |
+| :--- | :--- | :--- |
+| **SQL Server Error Log (`ERRORLOG` .. `ERRORLOG.6`)** | Exact startup timestamp (`SQL Server is starting...`), each database's startup (`Starting up database '...'`), and `Recovery is complete...` / `SQL Server is now ready for client connections.` (allowing exact **seconds-to-online** calculation). | **Only 7 files total** (1 current + 6 archived). Every restart or `sp_cycle_errorlog` deletes the oldest file! |
+| **Windows Event Logs (`System` & `Application`)** | `System`: Event ID `6005`/`6006`/`6008`/`1074`/`41` (OS reboots/crashes) & `7036` (SQL service stop/start). `Application`: `MSSQLSERVER` / `MSSQL$EXO` startup & recovery messages. | **Default 20 MB circular overwrite** (`Overwrite events as needed`); busy servers overwrite within weeks/months unless increased or forwarded. |
+| **SQL Server Default Trace (`sys.fn_trace_gettable`)** | `Audit Server Starts And Stops` (`EventClass = 18`). | **Only 5 x 20 MB = 100 MB** rolling files—often overwrites in days. |
+| **`system_health` Extended Events** | Recent ring/rollover `.xel` diagnostics. | **Only 4 x 5 MB = 20 MB** rolling files. |
+| **DMVs (`sys.dm_os_sys_info` / `tempdb` `create_date`)** | Only the **single most recent** `sqlserver_start_time`. | No history at all. |
+| **Central SIEM / Monitoring / Custom Audit Table** | Long-term forwarded logs (Splunk, Sentinel, SCOM, Redgate) or a DBA startup table populated on boot. | **12–36+ months** (if configured!). |
+
+#### 2. Can You Build This 12-Month Report Based on a *Default* SQL Server Setup?
+- **No — Not reliably!** (This is an **intentional architectural limitation / audit gap** in a default SQL Server installation.)
+- **Why a default setup fails a 12-month audit:**
+  1. **Only 6 Archived Error Logs (`NumErrorLogs = 6`):** Every restart rotates `ERRORLOG` $\rightarrow$ `ERRORLOG.1` ... and permanently deletes `ERRORLOG.6`. With 12 monthly patching windows per year *plus* any unplanned crashes or configuration restarts, **more than 7 restarts occur in 12 months**, so the oldest logs from 6–12 months ago are already gone!
+  2. **Default Trace (`100 MB`) and Default Windows Event Logs (`20 MB`) roll over** long before 12 months on an active production server.
+  3. **No Built-in "Service Window" Metadata:** SQL Server does not store your company's monthly maintenance window calendar; the DBA must define that window rule in the report logic.
+
+---
+
+### Step 10.2 — Audit Script (Across All Available Logs) & Permanent Remediation
+Below is a **T-SQL audit script** that scans **every currently available `ERRORLOG` archive** via `xp_enumerrorlogs` + `xp_readerrorlog`, computes how many seconds it took from SQL Server startup until recovery completed (`Recovery is complete`), classifies each restart against a configurable monthly service window (example: **3rd Sunday of the month, 02:00–06:00**), and **explicitly reports the actual date coverage** so IT-revision sees whether 12 full months of logs exist yet:
+
+```sql
+USE [master];
+GO
+
+SET NOCOUNT ON;
+
+-- ============================================================================
+-- 1. Enumerate all available SQL Server Error Log archives
+-- ============================================================================
+IF OBJECT_ID(N'tempdb..#ErrorLogArchives') IS NOT NULL DROP TABLE #ErrorLogArchives;
+CREATE TABLE #ErrorLogArchives (
+    ArchiveNo   INT,
+    LogDate     NVARCHAR(50),
+    LogSizeByte BIGINT
+);
+INSERT INTO #ErrorLogArchives
+EXEC master.dbo.xp_enumerrorlogs;
+
+IF OBJECT_ID(N'tempdb..#BootLines') IS NOT NULL DROP TABLE #BootLines;
+CREATE TABLE #BootLines (
+    ArchiveNo   INT,
+    LogDate     DATETIME2(3),
+    ProcessInfo NVARCHAR(50),
+    LogText     NVARCHAR(4000)
+);
+
+DECLARE @ArchiveNo INT;
+DECLARE @TmpLog TABLE (LogDate DATETIME2(3), ProcessInfo NVARCHAR(50), LogText NVARCHAR(4000));
+
+DECLARE ArchiveCursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT ArchiveNo FROM #ErrorLogArchives ORDER BY ArchiveNo ASC;
+
+OPEN ArchiveCursor;
+FETCH NEXT FROM ArchiveCursor INTO @ArchiveNo;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    DELETE FROM @TmpLog;
+    INSERT INTO @TmpLog
+    EXEC master.dbo.xp_readerrorlog @ArchiveNo, 1, N'SQL Server is starting';
+
+    INSERT INTO @TmpLog
+    EXEC master.dbo.xp_readerrorlog @ArchiveNo, 1, N'Recovery is complete';
+
+    INSERT INTO @TmpLog
+    EXEC master.dbo.xp_readerrorlog @ArchiveNo, 1, N'SQL Server is now ready for client connections';
+
+    INSERT INTO #BootLines (ArchiveNo, LogDate, ProcessInfo, LogText)
+    SELECT @ArchiveNo, LogDate, ProcessInfo, LogText
+    FROM @TmpLog;
+
+    FETCH NEXT FROM ArchiveCursor INTO @ArchiveNo;
+END
+
+CLOSE ArchiveCursor;
+DEALLOCATE ArchiveCursor;
+
+-- ============================================================================
+-- 2. Summarize each instance startup, recovery duration (seconds), & service window
+--    Example Monthly Service Window: 3rd Sunday of the month between 02:00 and 06:00
+-- ============================================================================
+;WITH RestartSummary AS (
+    SELECT
+        ArchiveNo,
+        MIN(CASE WHEN LogText LIKE N'SQL Server is starting%' THEN LogDate END) AS InstanceStartTime,
+        MAX(CASE WHEN LogText LIKE N'Recovery is complete%' THEN LogDate END)   AS DatabasesOnlineTime,
+        MAX(CASE WHEN LogText LIKE N'SQL Server is now ready%' THEN LogDate END) AS ReadyForConnectionsTime
+    FROM #BootLines
+    GROUP BY ArchiveNo
+    HAVING MIN(CASE WHEN LogText LIKE N'SQL Server is starting%' THEN LogDate END) IS NOT NULL
+),
+WindowClassified AS (
+    SELECT
+        ArchiveNo,
+        InstanceStartTime,
+        COALESCE(DatabasesOnlineTime, ReadyForConnectionsTime) AS OnlineTime,
+        DATEDIFF(SECOND, InstanceStartTime, COALESCE(DatabasesOnlineTime, ReadyForConnectionsTime)) AS RecoveryDurationSeconds,
+        -- Check Monthly Service Window (3rd Sunday: day 15..21, Sunday, 02:00-06:00)
+        CASE
+            WHEN DATENAME(WEEKDAY, InstanceStartTime) = N'Sunday'
+             AND DAY(InstanceStartTime) BETWEEN 15 AND 21
+             AND DATEPART(HOUR, InstanceStartTime) >= 2
+             AND DATEPART(HOUR, InstanceStartTime) < 6
+            THEN N'Inside Service Window'
+            ELSE N'OUTSIDE Service Window (Unplanned / Ad-Hoc)'
+        END AS ServiceWindowStatus
+    FROM RestartSummary
+)
+SELECT
+    ArchiveNo,
+    InstanceStartTime,
+    OnlineTime,
+    RecoveryDurationSeconds,
+    ServiceWindowStatus
+FROM WindowClassified
+WHERE InstanceStartTime >= DATEADD(MONTH, -12, GETDATE())
+ORDER BY InstanceStartTime DESC;
+
+-- Coverage Warning for IT-Revision
+SELECT
+    COUNT(*) AS AvailableErrorLogFiles,
+    MIN(LogDate) AS OldestRestartRecorded,
+    MAX(LogDate) AS LatestEventRecorded,
+    CASE
+        WHEN MIN(LogDate) > DATEADD(MONTH, -12, GETDATE())
+        THEN N'WARNING: Default SQL setup only retains limited ERRORLOG files. Full 12-month history is NOT available!'
+        ELSE N'OK: Full 12-month window covered.'
+    END AS AuditCoverageStatus
+FROM #BootLines;
+GO
+```
+
+#### Permanent Fix Going Forward (Make Future 12-Month Audits Possible!)
+1. **Increase SQL Server Error Log Retention from `6` to `99` files:**
+   ```sql
+   USE [master];
+   GO
+   -- Increase retained ERRORLOG archives from default 6 to 99
+   EXEC xp_instance_regwrite
+       N'HKEY_LOCAL_MACHINE',
+       N'Software\Microsoft\MSSQLServer\MSSQLServer',
+       N'NumErrorLogs',
+       REG_DWORD,
+       99;
+   GO
+   ```
+2. **Create a Persistent Startup Audit Procedure (`sp_procoption`)** that logs every boot and recovery time into a permanent DBA table in `msdb` (or a dedicated `DBA_Admin` database) so restarts are never lost to log rollover:
+   ```sql
+   USE [msdb];
+   GO
+
+   IF OBJECT_ID(N'dbo.DBA_InstanceRestartAudit', N'U') IS NULL
+   BEGIN
+       CREATE TABLE dbo.DBA_InstanceRestartAudit (
+           AuditID                 INT IDENTITY(1,1) PRIMARY KEY,
+           ServerName              SYSNAME        NOT NULL DEFAULT @@SERVERNAME,
+           InstanceStartTime       DATETIME2(3)   NOT NULL,
+           LoggedAt                DATETIME2(3)   NOT NULL DEFAULT SYSDATETIME(),
+           RecoveryDurationSeconds INT            NULL
+       );
+   END
+   GO
+
+   USE [master];
+   GO
+   CREATE OR ALTER PROCEDURE dbo.usp_LogInstanceStartup
+   AS
+   BEGIN
+       SET NOCOUNT ON;
+       -- Wait briefly so user databases finish recovery before capturing completion time
+       WAITFOR DELAY '00:00:10';
+
+       DECLARE @StartTime DATETIME2(3) = (SELECT sqlserver_start_time FROM sys.dm_os_sys_info);
+       DECLARE @Log TABLE (LogDate DATETIME2(3), ProcessInfo NVARCHAR(50), LogText NVARCHAR(4000));
+       INSERT INTO @Log EXEC master.dbo.xp_readerrorlog 0, 1, N'Recovery is complete';
+
+       DECLARE @OnlineTime DATETIME2(3) = ISNULL((SELECT MAX(LogDate) FROM @Log), SYSDATETIME());
+
+       INSERT INTO msdb.dbo.DBA_InstanceRestartAudit (InstanceStartTime, RecoveryDurationSeconds)
+       VALUES (@StartTime, DATEDIFF(SECOND, @StartTime, @OnlineTime));
+   END;
+   GO
+
+   -- Register procedure to execute automatically on every SQL Server startup
+   EXEC sp_procoption
+       @ProcName    = N'dbo.usp_LogInstanceStartup',
+       @OptionName  = 'startup',
+       @OptionValue = 'true';
+   GO
+   ```
+
+---
+
+## Part 11: `DatabaseMail.Notification` (Advanced) — DBA Email Standards, Process `KILL` Alerts, Rapid `TempDB` Growth & `TempDB` Shrink
+
+*(Uses `Papercut_Local_Profile` and `dba@anywhere.example` configured in Part 5, plus `msdb.dbo.DBA_TraceWatermark` from Part 6.)*
+
+### Step 11.1 — What Information Should Always Be Included in an Email Notification to the DBA?
+**Question:** *What information would you always include in an email notification to the DBA?*
+
+Every automated DBA alert email should be **self-contained and immediately actionable** without forcing the DBA to log in just to figure out *what*, *where*, or *who*:
+1. **Severity Tag & Clear Subject Line:** Prefix with `[CRITICAL]`, `[WARNING]`, `[AUDIT]`, or `[INFO]` + short issue summary + `@@SERVERNAME` (enables inbox filtering and on-call paging rules).
+2. **Environment / Instance Identification:** Hostname, SQL Instance (`@@SERVERNAME`), and Environment label (Prod/Test/Lab) so a Lab spike doesn't wake up Production on-call.
+3. **Exact Timestamp:** Local server time (and/or UTC) of *when the event occurred* vs. *when the alert fired*.
+4. **Affected Target / Object:** Database name, logical/physical filename, SPID, or Job name.
+5. **Identity & Client Origin ("Who & From Where"):**
+   - **Both** `EffectiveLogin` (`LoginName` / `server_principal_name`) **and** `OriginalLogin` (`SessionLoginName` / `ORIGINAL_LOGIN()`) to expose `EXECUTE AS` impersonation.
+   - `HostName` (workstation/app server) and `ApplicationName` (SSMS, `sqlcmd`, service name).
+6. **Quantified Metrics, Deltas & Thresholds:** Exact numbers (`Previous MB -> Current MB`, `Delta MB / %`, `MaxSize MB`, `% of Max`), not vague text like *"TempDB grew"*.
+7. **Verbatim Statement / Error Context:** Exact T-SQL command (`KILL 61`, `DBCC SHRINKFILE`, or top consuming query text) or Error Number / Severity / State.
+8. **Immediate Triage Hint / Next Action:** A short one-line DBA hint (e.g., *"Inspect `sys.dm_db_session_space_usage` for SPID 64"*).
+
+---
+
+### Step 11.2 — Send HTML/CSS Mail If Anyone Kills a SQL Server Process (`Alert_ProcessKilled`) + Test
+**Task:** *Send mail if anyone kills a SQL Server process. Test the solution.*
+
+#### Why Extended Events (Not Default Trace)?
+SQL Server's **Default Trace** does *not* log normal `KILL <spid>` T-SQL commands. The cleanest, lightweight way to capture every `KILL` command—including who ran it, from which workstation/app, against which target, and whether it succeeded—is a persistent **Extended Events** session (`DBA_ProcessTermination_Monitor`) paired with a **SQL Agent job** (`Alert_ProcessKilled`) using a watermark in `msdb.dbo.DBA_TraceWatermark`.
+
+> [!NOTE]
+> **Avoiding Self-Triggering Loops:** Never name the Extended Event session `*KILL*` or filter broadly on `%KILL%` without tightening the statement match—otherwise the monitoring job's own SQL text mentioning `KILL` could match its own filter! Below, we name the session `DBA_ProcessTermination_Monitor`, use `sqlserver.sql_statement_completed` (with `MAX_DISPATCH_LATENCY = 1 SECONDS` for near-instant lab testing), and validate `LTRIM(StatementText) LIKE N'KILL [0-9]%' OR LTRIM(StatementText) LIKE N'KILL STATS JOB%'` in T-SQL.
+
+#### How to do it
+1. **Create & start the Extended Events session and add the watermark key:**
+   ```sql
+   USE [master];
+   GO
+
+   -- Create/recreate Extended Event session storing .xel files in C:\Exo\Database
+   IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'DBA_ProcessTermination_Monitor')
+       DROP EVENT SESSION [DBA_ProcessTermination_Monitor] ON SERVER;
+   GO
+
+   CREATE EVENT SESSION [DBA_ProcessTermination_Monitor] ON SERVER
+   ADD EVENT sqlserver.sql_statement_completed (
+       ACTION (
+           sqlserver.server_principal_name,
+           sqlserver.session_nt_username,
+           sqlserver.client_hostname,
+           sqlserver.client_app_name,
+           sqlserver.database_name,
+           sqlserver.session_id,
+           sqlserver.sql_text
+       )
+       WHERE (
+           sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%KILL %')
+       )
+   )
+   ADD TARGET package0.event_file (
+       SET filename = N'C:\Exo\Database\DBA_ProcessTermination_Monitor.xel',
+           max_file_size = 10,
+           max_rollover_files = 3
+   )
+   WITH (
+       MAX_MEMORY = 4096 KB,
+       EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS,
+       MAX_DISPATCH_LATENCY = 1 SECONDS,
+       STARTUP_STATE = ON
+   );
+   GO
+
+   ALTER EVENT SESSION [DBA_ProcessTermination_Monitor] ON SERVER STATE = START;
+   GO
+
+   -- Register UTC watermark in msdb.dbo.DBA_TraceWatermark (created in Part 6)
+   USE [msdb];
+   GO
+   IF OBJECT_ID(N'dbo.DBA_TraceWatermark', N'U') IS NULL
+   BEGIN
+       CREATE TABLE dbo.DBA_TraceWatermark (
+           CheckKey      VARCHAR(50) NOT NULL PRIMARY KEY,
+           LastEventTime DATETIME2(3) NOT NULL
+       );
+   END
+
+   IF NOT EXISTS (SELECT 1 FROM dbo.DBA_TraceWatermark WHERE CheckKey = 'KILL_MONITOR_UTC')
+   BEGIN
+       INSERT INTO dbo.DBA_TraceWatermark (CheckKey, LastEventTime)
+       VALUES ('KILL_MONITOR_UTC', DATEADD(SECOND, -5, SYSUTCDATETIME()));
+   END
+   GO
+   ```
+
+2. **Create the SQL Agent Job `Alert_ProcessKilled`:**
+   ```sql
+   USE [msdb];
+   GO
+
+   IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'Alert_ProcessKilled')
+       EXEC msdb.dbo.sp_delete_job @job_name = N'Alert_ProcessKilled', @delete_unused_schedule = 1;
+   GO
+
+   EXEC dbo.sp_add_job
+       @job_name    = N'Alert_ProcessKilled',
+       @enabled     = 1,
+       @description = N'Checks Extended Events for KILL process commands and sends an HTML/CSS alert email to the DBA.';
+   GO
+
+   EXEC dbo.sp_add_jobstep
+       @job_name      = N'Alert_ProcessKilled',
+       @step_name     = N'Check XE for KILL Commands and Notify',
+       @subsystem     = N'TSQL',
+       @database_name = N'msdb',
+       @command       = N'
+   SET NOCOUNT ON;
+   SET QUOTED_IDENTIFIER ON; -- Required for XML .value() methods inside SQL Agent T-SQL steps!
+
+   DECLARE @LastUtc DATETIME2(3);
+   SELECT @LastUtc = LastEventTime
+   FROM msdb.dbo.DBA_TraceWatermark
+   WHERE CheckKey = ''KILL_MONITOR_UTC'';
+
+   IF @LastUtc IS NULL SET @LastUtc = DATEADD(MINUTE, -10, SYSUTCDATETIME());
+
+   DECLARE @UtcOffsetMinutes INT = DATEDIFF(MINUTE, GETUTCDATE(), GETDATE());
+
+   IF OBJECT_ID(N''tempdb..#KillEvents'') IS NOT NULL DROP TABLE #KillEvents;
+
+   ;WITH RawEvents AS (
+       SELECT CAST(event_data AS XML) AS x
+       FROM sys.fn_xe_file_target_read_file(
+           N''C:\Exo\Database\DBA_ProcessTermination_Monitor*.xel'',
+           NULL, NULL, NULL
+       )
+   ),
+   Parsed AS (
+       SELECT
+           x.value(''(event/@timestamp)[1]'', ''DATETIME2(3)'')                                AS EventTimeUtc,
+           ISNULL(x.value(''(event/action[@name="server_principal_name"]/value)[1]'', ''NVARCHAR(128)''), N''-'') AS ExecutedByLogin,
+           ISNULL(x.value(''(event/action[@name="session_nt_username"]/value)[1]'', ''NVARCHAR(128)''), N''-'')   AS WindowsUser,
+           ISNULL(x.value(''(event/action[@name="client_hostname"]/value)[1]'', ''NVARCHAR(128)''), N''-'')       AS HostName,
+           ISNULL(x.value(''(event/action[@name="client_app_name"]/value)[1]'', ''NVARCHAR(256)''), N''-'')       AS ApplicationName,
+           ISNULL(x.value(''(event/action[@name="database_name"]/value)[1]'', ''SYSNAME''), N''master'')           AS DatabaseContext,
+           x.value(''(event/action[@name="session_id"]/value)[1]'', ''INT'')                                       AS KillerSPID,
+           ISNULL(x.value(''(event/data[@name="result"]/text)[1]'', ''NVARCHAR(64)''), N''OK'')                   AS ResultStatus,
+           LTRIM(RTRIM(ISNULL(
+               x.value(''(event/data[@name="statement"]/value)[1]'', ''NVARCHAR(MAX)''),
+               x.value(''(event/action[@name="sql_text"]/value)[1]'', ''NVARCHAR(MAX)'')
+           ))) AS StatementText
+       FROM RawEvents
+   )
+   SELECT
+       EventTimeUtc,
+       DATEADD(MINUTE, @UtcOffsetMinutes, EventTimeUtc) AS EventTimeLocal,
+       ExecutedByLogin,
+       WindowsUser,
+       HostName,
+       ApplicationName,
+       DatabaseContext,
+       KillerSPID,
+       ResultStatus,
+       LEFT(StatementText, 400) AS StatementText
+   INTO #KillEvents
+   FROM Parsed
+   WHERE EventTimeUtc > @LastUtc
+     AND (
+           StatementText LIKE N''KILL [0-9]%''
+        OR StatementText LIKE N''KILL STATS JOB%''
+     );
+
+   IF EXISTS (SELECT 1 FROM #KillEvents)
+   BEGIN
+       DECLARE @TableRows NVARCHAR(MAX);
+       DECLARE @HtmlBody  NVARCHAR(MAX);
+       DECLARE @Subject   NVARCHAR(255) = N''[WARNING] SQL Process KILL Executed on '' + @@SERVERNAME;
+
+       SELECT @TableRows = CAST((
+           SELECT
+               td = CONVERT(NVARCHAR(23), EventTimeLocal, 121), N'''',
+               td = ExecutedByLogin,                            N'''',
+               td = WindowsUser,                                N'''',
+               td = CAST(KillerSPID AS NVARCHAR(15)),           N'''',
+               td = HostName,                                   N'''',
+               td = ApplicationName,                            N'''',
+               td = DatabaseContext,                            N'''',
+               td = ResultStatus,                               N'''',
+               td = StatementText
+           FROM #KillEvents
+           ORDER BY EventTimeUtc ASC
+           FOR XML PATH(''tr''), TYPE
+       ) AS NVARCHAR(MAX));
+
+       SET @HtmlBody = N''
+       <html>
+       <head>
+           <style>
+               body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; background-color: #f3f4f6; margin: 0; padding: 20px; }
+               .card { background: #ffffff; border: 1px solid #d1d5db; border-radius: 8px; padding: 20px; max-width: 1100px; }
+               h2 { color: #b45309; margin-top: 0; }
+               .meta { font-size: 13px; color: #4b5563; margin-bottom: 14px; }
+               table { border-collapse: collapse; width: 100%; font-size: 13px; }
+               th { background-color: #92400e; color: #ffffff; text-align: left; padding: 10px 12px; border: 1px solid #78350f; }
+               td { padding: 8px 12px; border: 1px solid #e5e7eb; vertical-align: top; }
+               tr:nth-child(even) td { background-color: #fffbeb; }
+               .hint { margin-top: 14px; font-size: 12px; color: #6b7280; }
+           </style>
+       </head>
+       <body>
+           <div class="card">
+               <h2>SQL Server Process Termination (KILL) Alert</h2>
+               <div class="meta">
+                   <strong>Server:</strong> '' + @@SERVERNAME + N'' &nbsp;|&nbsp;
+                   <strong>Alert Time:</strong> '' + CONVERT(NVARCHAR(23), GETDATE(), 121) + N''
+               </div>
+               <table>
+                   <thead>
+                       <tr>
+                           <th>Event Time (Local)</th>
+                           <th>SQL Login</th>
+                           <th>Windows User</th>
+                           <th>Caller SPID</th>
+                           <th>Host</th>
+                           <th>Application</th>
+                           <th>DB Context</th>
+                           <th>Result</th>
+                           <th>Command Executed</th>
+                       </tr>
+                   </thead>
+                   <tbody>'' + ISNULL(@TableRows, N'''') + N''</tbody>
+               </table>
+               <div class="hint">Next Action: Verify with the operator whether this termination was planned and check for long-running rollbacks via <code>KILL &lt;spid&gt; WITH STATUSONLY</code>.</div>
+           </div>
+       </body>
+       </html>'';
+
+       EXEC msdb.dbo.sp_send_dbmail
+           @profile_name = N''Papercut_Local_Profile'',
+           @recipients   = N''dba@anywhere.example'',
+           @subject      = @Subject,
+           @body         = @HtmlBody,
+           @body_format  = N''HTML'',
+           @importance   = N''HIGH'';
+
+       UPDATE msdb.dbo.DBA_TraceWatermark
+       SET LastEventTime = (SELECT MAX(EventTimeUtc) FROM #KillEvents)
+       WHERE CheckKey = ''KILL_MONITOR_UTC'';
+   END
+   ';
+   GO
+
+   EXEC dbo.sp_add_jobserver
+       @job_name    = N'Alert_ProcessKilled',
+       @server_name = N'(local)';
+   GO
+   ```
+
+#### Testing `Alert_ProcessKilled`
+1. Open a **second query tab (Tab 2)** in SSMS and run:
+   ```sql
+   SELECT @@SPID AS VictimSPID; -- Note the exact SPID number printed (e.g., 85)
+   WAITFOR DELAY '00:05:00';
+   ```
+2. In **Tab 1**, kill that **exact** SPID (replace `<VictimSPID>` with the number printed in Tab 2!), wait 2 seconds for the XE buffer to flush, and run the job:
+   ```sql
+   KILL <VictimSPID>; -- e.g. KILL 85;
+   WAITFOR DELAY '00:00:02';
+   EXEC msdb.dbo.sp_start_job @job_name = N'Alert_ProcessKilled';
+   GO
+   ```
+3. Check **Papercut SMTP** (and `msdb.dbo.sysmail_allitems`): you should receive `[WARNING] SQL Process KILL Executed on EXOPI-908\EXO` (your server name) showing the exact `SQL Login`, `Host`, `Application`, `Result` (`OK`), and `KILL <VictimSPID>` command in a styled HTML table.
+
+#### Key Learnings & Traps
+- **Trap 1 (SQL Server Agent Defaults to `QUOTED_IDENTIFIER OFF`):** T-SQL job steps executed by SQL Server Agent run with `SET QUOTED_IDENTIFIER OFF` by default. Any query using XML data type methods (`.value()`, `.nodes()`) with `SELECT ... INTO` or DML fails with **Error 1934** unless you explicitly include `SET QUOTED_IDENTIFIER ON;` at the top of the job step.
+- **Trap 2 (Failed `KILL` vs. Successful `KILL`):** `sqlserver.sql_statement_completed` only fires when `KILL <spid>` targets an active SPID and succeeds (if you mistype a nonexistent SPID and hit `Msg 6106`, `sql_statement_completed` will not fire).
+
+---
+
+### Step 11.3 — Send HTML/CSS Mail If `TempDB` Grows Rapidly (`Alert_TempDB_RapidGrowth`)
+**Task:** *Send mail if TempDB database grows rapidly. I know! Define rapidly. But try to come up with a solution anyway. Ideally you want to be notified before database end users tell you that query responses are slow.*
+
+#### How Do We Define "Rapidly" — And Catch It *Before* Users Notice Slowness?
+Relying solely on physical disk autogrowth is often *too late* if `tempdb` was pre-sized large (users already hit I/O saturation or wait for memory/tempdb allocations before the file grows). A proactive DBA monitor defines "rapid growth" using **three complementary signals** sampled every 1 minute:
+1. **Rapid Physical File Growth Rate:** Total allocated `tempdb` size increased by **`>= 128 MB`** OR **`>= 25%`** within a **5-minute** rolling window.
+2. **Autogrowth Burst Detection (Default Trace `EventClass IN (92, 93)`):** `tempdb` experienced **`>= 2` physical auto-grow events** (Data or Log) within 5 minutes (frequent small autogrowths cause I/O stalls and immediately slow down user queries!).
+3. **Proactive Internal Space Pressure (Early Warning):** Active internal `tempdb` page consumption (`user_object_reserved` + `internal_object_reserved` + `version_store_reserved`) exceeds **`70%`** of current allocated `tempdb` space (or **`70%`** of configured `MAXSIZE`)—alerting the DBA *while* free pages remain and *before* autogrowth stalls or `Error 1105` hit end users!
+
+And crucially, when an alert fires, the email automatically includes a **Top 5 `TempDB` Space-Consuming Sessions** table (`sys.dm_db_session_space_usage` + `sys.dm_db_task_space_usage` + `sys.dm_exec_sql_text`) so the DBA can identify the offending query immediately.
+
+#### How to do it
+1. **Create the snapshot & cooldown tracking table in `msdb`:**
+   ```sql
+   USE [msdb];
+   GO
+
+   IF OBJECT_ID(N'dbo.DBA_TempDB_GrowthHistory', N'U') IS NULL
+   BEGIN
+       CREATE TABLE dbo.DBA_TempDB_GrowthHistory (
+           SampleID          INT IDENTITY(1,1) PRIMARY KEY,
+           SampleTime        DATETIME2(3)   NOT NULL DEFAULT SYSDATETIME(),
+           AllocatedSizeMB   DECIMAL(12, 2) NOT NULL,
+           InternalUsedMB    DECIMAL(12, 2) NOT NULL,
+           ConfiguredMaxMB   DECIMAL(12, 2) NULL,
+           AlertSent         BIT            NOT NULL DEFAULT 0
+       );
+   END
+   GO
+   ```
+
+2. **Create the SQL Agent Job `Alert_TempDB_RapidGrowth` (with a 1-minute schedule):**
+   ```sql
+   USE [msdb];
+   GO
+
+   IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'Alert_TempDB_RapidGrowth')
+       EXEC msdb.dbo.sp_delete_job @job_name = N'Alert_TempDB_RapidGrowth', @delete_unused_schedule = 1;
+   GO
+
+   EXEC dbo.sp_add_job
+       @job_name    = N'Alert_TempDB_RapidGrowth',
+       @enabled     = 1,
+       @description = N'Detects rapid TempDB physical growth, autogrowth bursts, or high internal space pressure and emails top consuming sessions.';
+   GO
+
+   EXEC dbo.sp_add_jobstep
+       @job_name      = N'Alert_TempDB_RapidGrowth',
+       @step_name     = N'Evaluate TempDB Growth and Send HTML Alert',
+       @subsystem     = N'TSQL',
+       @database_name = N'msdb',
+       @command       = N'
+   SET NOCOUNT ON;
+   SET QUOTED_IDENTIFIER ON;
+
+   -- ============================================================================
+   -- CONFIGURABLE "RAPID GROWTH" THRESHOLDS
+   -- ============================================================================
+   DECLARE @WindowMinutes      INT           = 5;     -- Lookback window
+   DECLARE @RapidGrowthMB      DECIMAL(12,2) = 128.0; -- >= 128 MB jump in 5 min
+   DECLARE @RapidGrowthPct     DECIMAL(6,2)  = 25.0;  -- OR >= 25% jump in 5 min
+   DECLARE @AutoGrowBurstCount INT           = 2;     -- OR >= 2 physical auto-grows in 5 min
+   DECLARE @EarlyWarnUsedPct   DECIMAL(6,2)  = 70.0;  -- Early warning at >= 70% internal usage
+   DECLARE @CooldownMinutes    INT           = 5;     -- Minimum minutes between repeat alerts
+
+   DECLARE @Now DATETIME2(3) = SYSDATETIME();
+
+   -- 1. Measure current TempDB allocated size, configured MaxSize, and internal used pages
+   DECLARE @CurrentAllocatedMB DECIMAL(12,2);
+   DECLARE @ConfiguredMaxMB    DECIMAL(12,2);
+   DECLARE @InternalUsedMB     DECIMAL(12,2);
+   DECLARE @UserObjMB          DECIMAL(12,2);
+   DECLARE @InternalObjMB      DECIMAL(12,2);
+   DECLARE @VersionStoreMB     DECIMAL(12,2);
+
+   SELECT
+       @CurrentAllocatedMB = SUM(CAST(size AS BIGINT)) * 8.0 / 1024.0,
+       @ConfiguredMaxMB    = CASE WHEN MIN(max_size) = -1 THEN NULL
+                                  ELSE SUM(CAST(max_size AS BIGINT)) * 8.0 / 1024.0 END
+   FROM sys.master_files
+   WHERE database_id = DB_ID(N''tempdb'');
+
+   SELECT
+       @UserObjMB      = SUM(CAST(user_object_reserved_page_count AS BIGINT)) * 8.0 / 1024.0,
+       @InternalObjMB  = SUM(CAST(internal_object_reserved_page_count AS BIGINT)) * 8.0 / 1024.0,
+       @VersionStoreMB = SUM(CAST(version_store_reserved_page_count AS BIGINT)) * 8.0 / 1024.0,
+       @InternalUsedMB = SUM(CAST(user_object_reserved_page_count
+                                + internal_object_reserved_page_count
+                                + version_store_reserved_page_count AS BIGINT)) * 8.0 / 1024.0
+   FROM tempdb.sys.dm_db_file_space_usage;
+
+   -- 2. Look up baseline size ~@WindowMinutes ago
+   DECLARE @BaselineSizeMB DECIMAL(12,2);
+   SELECT TOP (1) @BaselineSizeMB = AllocatedSizeMB
+   FROM msdb.dbo.DBA_TempDB_GrowthHistory
+   WHERE SampleTime >= DATEADD(MINUTE, -@WindowMinutes, @Now)
+   ORDER BY SampleTime ASC;
+
+   IF @BaselineSizeMB IS NULL SET @BaselineSizeMB = @CurrentAllocatedMB;
+
+   DECLARE @GrowthMB  DECIMAL(12,2) = @CurrentAllocatedMB - @BaselineSizeMB;
+   DECLARE @GrowthPct DECIMAL(8,2)  = CASE WHEN @BaselineSizeMB > 0
+                                           THEN (@GrowthMB / @BaselineSizeMB) * 100.0
+                                           ELSE 0 END;
+   DECLARE @UsedPct   DECIMAL(8,2)  = CASE WHEN @CurrentAllocatedMB > 0
+                                           THEN (@InternalUsedMB / @CurrentAllocatedMB) * 100.0
+                                           ELSE 0 END;
+
+   -- 3. Check Default Trace for recent TempDB Auto-Grow events (EventClass 92 = Data, 93 = Log)
+   DECLARE @AutoGrowCount INT = 0;
+   DECLARE @AutoGrowMB    DECIMAL(12,2) = 0;
+   DECLARE @TracePath     NVARCHAR(260) = (SELECT [path] FROM sys.traces WHERE is_default = 1);
+
+   IF @TracePath IS NOT NULL
+   BEGIN
+       SELECT
+           @AutoGrowCount = COUNT(*),
+           @AutoGrowMB    = ISNULL(SUM(CAST(IntegerData AS BIGINT) * 8.0 / 1024.0), 0)
+       FROM sys.fn_trace_gettable(@TracePath, DEFAULT)
+       WHERE EventClass IN (92, 93)
+         AND DatabaseName = N''tempdb''
+         AND StartTime >= DATEADD(MINUTE, -@WindowMinutes, GETDATE());
+   END
+
+   -- 4. Determine whether any trigger rule fired (respecting cooldown)
+   DECLARE @LastAlertTime DATETIME2(3) = (
+       SELECT MAX(SampleTime) FROM msdb.dbo.DBA_TempDB_GrowthHistory WHERE AlertSent = 1
+   );
+   DECLARE @InCooldown BIT = CASE
+       WHEN @LastAlertTime IS NOT NULL AND @LastAlertTime > DATEADD(MINUTE, -@CooldownMinutes, @Now) THEN 1
+       ELSE 0
+   END;
+
+   DECLARE @TriggerReason NVARCHAR(500) = N'''';
+   IF @GrowthMB >= @RapidGrowthMB
+       SET @TriggerReason += CONCAT(N''Rapid Size Jump (+'', @GrowthMB, N'' MB in '', @WindowMinutes, N''m); '');
+   IF @GrowthPct >= @RapidGrowthPct
+       SET @TriggerReason += CONCAT(N''Rapid % Growth (+'', @GrowthPct, N''%); '');
+   IF @AutoGrowCount >= @AutoGrowBurstCount
+       SET @TriggerReason += CONCAT(@AutoGrowCount, N'' Auto-Grow Events (+'', @AutoGrowMB, N'' MB); '');
+   IF @UsedPct >= @EarlyWarnUsedPct
+       SET @TriggerReason += CONCAT(N''High Internal Usage ('', @UsedPct, N''% used); '');
+
+   DECLARE @ShouldAlert BIT = CASE WHEN LEN(@TriggerReason) > 0 AND @InCooldown = 0 THEN 1 ELSE 0 END;
+
+   INSERT INTO msdb.dbo.DBA_TempDB_GrowthHistory (SampleTime, AllocatedSizeMB, InternalUsedMB, ConfiguredMaxMB, AlertSent)
+   VALUES (@Now, @CurrentAllocatedMB, @InternalUsedMB, @ConfiguredMaxMB, @ShouldAlert);
+
+   -- Prune history older than 7 days
+   DELETE FROM msdb.dbo.DBA_TempDB_GrowthHistory WHERE SampleTime < DATEADD(DAY, -7, @Now);
+
+   IF @ShouldAlert = 1
+   BEGIN
+       -- Capture Top 5 active TempDB consumers (Session + Task allocations)
+       IF OBJECT_ID(N''tempdb..#TopConsumers'') IS NOT NULL DROP TABLE #TopConsumers;
+
+       ;WITH SessionSpace AS (
+           SELECT
+               ssu.session_id,
+               CAST((ssu.user_objects_alloc_page_count - ssu.user_objects_dealloc_page_count
+                   + ssu.internal_objects_alloc_page_count - ssu.internal_objects_dealloc_page_count) * 8.0 / 1024.0 AS DECIMAL(12,2)) AS SessionNetMB,
+               CAST(ISNULL(tsu.TaskAllocPages, 0) * 8.0 / 1024.0 AS DECIMAL(12,2)) AS ActiveTaskMB
+           FROM tempdb.sys.dm_db_session_space_usage ssu
+           OUTER APPLY (
+               SELECT SUM(CAST(user_objects_alloc_page_count - user_objects_dealloc_page_count
+                             + internal_objects_alloc_page_count - internal_objects_dealloc_page_count AS BIGINT)) AS TaskAllocPages
+               FROM tempdb.sys.dm_db_task_space_usage t
+               WHERE t.session_id = ssu.session_id
+           ) tsu
+           WHERE ssu.session_id > 50
+       )
+       SELECT TOP (5)
+           sp.session_id AS SPID,
+           ISNULL(es.login_name, N''-'') AS EffectiveLogin,
+           ISNULL(es.original_login_name, N''-'') AS OriginalLogin,
+           ISNULL(es.host_name, N''-'') AS HostName,
+           ISNULL(es.program_name, N''-'') AS ApplicationName,
+           CAST(CASE WHEN sp.SessionNetMB + sp.ActiveTaskMB < 0 THEN 0
+                     ELSE sp.SessionNetMB + sp.ActiveTaskMB END AS DECIMAL(12,2)) AS TempDBUsedMB,
+           ISNULL(LEFT(st.text, 250), N''(Idle / Cached Temp Object)'') AS QuerySnippet
+       INTO #TopConsumers
+       FROM SessionSpace sp
+       JOIN sys.dm_exec_sessions es ON sp.session_id = es.session_id
+       LEFT JOIN sys.dm_exec_requests er ON sp.session_id = er.session_id
+       OUTER APPLY sys.dm_exec_sql_text(er.sql_handle) st
+       WHERE sp.SessionNetMB + sp.ActiveTaskMB > 0
+       ORDER BY TempDBUsedMB DESC;
+
+       DECLARE @ConsumerRows NVARCHAR(MAX) = CAST((
+           SELECT
+               td = CAST(SPID AS NVARCHAR(10)),          N'''',
+               td = EffectiveLogin,                       N'''',
+               td = OriginalLogin,                        N'''',
+               td = HostName,                             N'''',
+               td = ApplicationName,                      N'''',
+               td = CAST(TempDBUsedMB AS NVARCHAR(20)),   N'''',
+               td = QuerySnippet
+           FROM #TopConsumers
+           ORDER BY TempDBUsedMB DESC
+           FOR XML PATH(''tr''), TYPE
+       ) AS NVARCHAR(MAX));
+
+       DECLARE @Subject NVARCHAR(255) = N''[WARNING] Rapid TempDB Growth / Pressure on '' + @@SERVERNAME;
+       DECLARE @HtmlBody NVARCHAR(MAX) = N''
+       <html>
+       <head>
+           <style>
+               body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; background-color: #f3f4f6; margin: 0; padding: 20px; }
+               .card { background: #ffffff; border: 1px solid #d1d5db; border-radius: 8px; padding: 20px; max-width: 1100px; }
+               h2 { color: #c2410c; margin-top: 0; }
+               h3 { color: #374151; margin-top: 20px; margin-bottom: 8px; }
+               table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 8px; }
+               th { background-color: #9a3412; color: #ffffff; text-align: left; padding: 9px 12px; border: 1px solid #7c2d12; }
+               td { padding: 8px 12px; border: 1px solid #e5e7eb; vertical-align: top; }
+               tr:nth-child(even) td { background-color: #fff7ed; }
+               .badge { display: inline-block; padding: 4px 8px; background: #ffedd5; color: #9a3412; border-radius: 4px; font-weight: 600; font-size: 12px; }
+           </style>
+       </head>
+       <body>
+           <div class="card">
+               <h2>Rapid TempDB Growth / Early Pressure Alert</h2>
+               <p><strong>Server:</strong> '' + @@SERVERNAME + N'' &nbsp;|&nbsp; <strong>Detected At:</strong> '' + CONVERT(NVARCHAR(23), @Now, 121) + N''</p>
+               <p><span class="badge">Trigger: '' + @TriggerReason + N''</span></p>
+               <h3>TempDB Space Summary</h3>
+               <table>
+                   <thead>
+                       <tr>
+                           <th>Baseline (5m Ago)</th>
+                           <th>Current Allocated</th>
+                           <th>Growth Delta</th>
+                           <th>Internal Used (%)</th>
+                           <th>User / Internal / VerStore MB</th>
+                           <th>Configured MaxSize</th>
+                           <th>5m AutoGrows</th>
+                       </tr>
+                   </thead>
+                   <tbody>
+                       <tr>
+                           <td>'' + CAST(@BaselineSizeMB AS NVARCHAR(20)) + N'' MB</td>
+                           <td>'' + CAST(@CurrentAllocatedMB AS NVARCHAR(20)) + N'' MB</td>
+                           <td>+'' + CAST(@GrowthMB AS NVARCHAR(20)) + N'' MB ('' + CAST(@GrowthPct AS NVARCHAR(20)) + N''%)</td>
+                           <td>'' + CAST(@InternalUsedMB AS NVARCHAR(20)) + N'' MB ('' + CAST(@UsedPct AS NVARCHAR(20)) + N''%)</td>
+                           <td>'' + CAST(@UserObjMB AS NVARCHAR(20)) + N'' / '' + CAST(@InternalObjMB AS NVARCHAR(20)) + N'' / '' + CAST(@VersionStoreMB AS NVARCHAR(20)) + N''</td>
+                           <td>'' + ISNULL(CAST(@ConfiguredMaxMB AS NVARCHAR(20)) + N'' MB'', N''Unlimited'') + N''</td>
+                           <td>'' + CAST(@AutoGrowCount AS NVARCHAR(10)) + N'' (+'' + CAST(@AutoGrowMB AS NVARCHAR(20)) + N'' MB)</td>
+                       </tr>
+                   </tbody>
+               </table>
+               <h3>Top Active TempDB Space Consumers</h3>
+               <table>
+                   <thead>
+                       <tr>
+                           <th>SPID</th>
+                           <th>Effective Login</th>
+                           <th>Original Login</th>
+                           <th>Host</th>
+                           <th>Application</th>
+                           <th>TempDB Used (MB)</th>
+                           <th>Running Query</th>
+                       </tr>
+                   </thead>
+                   <tbody>'' + ISNULL(@ConsumerRows, N''<tr><td colspan="7">No active user session allocations remaining (likely completed or version store).</td></tr>'') + N''</tbody>
+               </table>
+           </div>
+       </body>
+       </html>'';
+
+       EXEC msdb.dbo.sp_send_dbmail
+           @profile_name = N''Papercut_Local_Profile'',
+           @recipients   = N''dba@anywhere.example'',
+           @subject      = @Subject,
+           @body         = @HtmlBody,
+           @body_format  = N''HTML'',
+           @importance   = N''HIGH'';
+   END
+   ';
+   GO
+
+   -- Attach a 1-minute schedule so the job proactively monitors TempDB in the background
+   IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysschedules WHERE name = N'Every_1_Minute_TempDB_Watch')
+   BEGIN
+       EXEC dbo.sp_add_schedule
+           @schedule_name        = N'Every_1_Minute_TempDB_Watch',
+           @enabled              = 1,
+           @freq_type            = 4, -- Daily
+           @freq_interval        = 1,
+           @freq_subday_type     = 4, -- Minutes
+           @freq_subday_interval = 1;
+   END
+
+   EXEC dbo.sp_attach_schedule
+       @job_name      = N'Alert_TempDB_RapidGrowth',
+       @schedule_name = N'Every_1_Minute_TempDB_Watch';
+
+   EXEC dbo.sp_add_jobserver
+       @job_name    = N'Alert_TempDB_RapidGrowth',
+       @server_name = N'(local)';
+   GO
+   ```
+
+#### Testing `Alert_TempDB_RapidGrowth` Safely
+1. **Run once to establish the baseline snapshot:**
+   ```sql
+   EXEC msdb.dbo.sp_start_job @job_name = N'Alert_TempDB_RapidGrowth';
+   GO
+   ```
+2. **Simulate rapid `#temp` table growth (~160 MB) and trigger the alert:**
+   ```sql
+   CREATE TABLE #RapidGrowthTest (
+       ID INT IDENTITY(1,1) PRIMARY KEY,
+       Padding CHAR(4000) NOT NULL DEFAULT REPLICATE('X', 4000)
+   );
+
+   -- Insert ~40,000 rows (~160 MB) into TempDB
+   INSERT INTO #RapidGrowthTest (Padding)
+   SELECT TOP (40000) REPLICATE('X', 4000)
+   FROM sys.all_objects a
+   CROSS JOIN sys.all_objects b;
+   GO
+
+   -- Run the job immediately (while #RapidGrowthTest is still open so Top Consumers shows this SPID!)
+   EXEC msdb.dbo.sp_start_job @job_name = N'Alert_TempDB_RapidGrowth';
+   GO
+
+   -- Wait 5 seconds, check Papercut SMTP, then clean up
+   WAITFOR DELAY '00:00:05';
+   DROP TABLE #RapidGrowthTest;
+   GO
+   ```
+
+---
+
+### Step 11.4 — Send HTML/CSS Mail If `TempDB` Files Shrink in Size (`Alert_TempDB_Shrink`) + Test
+**Task:** *Send mail if TempDB files shrink in size. Test the solution.*
+
+#### Why Compare Persistent File Sizes (Plus Default Trace)?
+Default Trace's `EventClass IN (94, 95)` only logs **automatic** `AUTO_SHRINK` events—it does **not** fire when a DBA runs `DBCC SHRINKFILE`, uses the SSMS Shrink GUI, or restarts SQL Server (which resets `tempdb` back to initial size).
+By tracking every `tempdb` file's last observed `size` in **`msdb.dbo.DBA_TempDB_FileBaseline`**, we catch **100% of shrink events** regardless of cause, and enrich the alert with **Default Trace `EventClass = 116` (`Audit DBCC Event`)** to show *who* ran `DBCC SHRINKFILE` / `DBCC SHRINKDATABASE`!
+
+#### How to do it
+1. **Create the file-size baseline table in `msdb`:**
+   ```sql
+   USE [msdb];
+   GO
+
+   IF OBJECT_ID(N'dbo.DBA_TempDB_FileBaseline', N'U') IS NULL
+   BEGIN
+       CREATE TABLE dbo.DBA_TempDB_FileBaseline (
+           FileID        INT            NOT NULL PRIMARY KEY,
+           LogicalName   SYSNAME        NOT NULL,
+           FileType      NVARCHAR(60)   NOT NULL,
+           PhysicalName  NVARCHAR(260)  NOT NULL,
+           LastSizeMB    DECIMAL(12, 2) NOT NULL,
+           LastCheckedAt DATETIME2(3)   NOT NULL DEFAULT SYSDATETIME()
+       );
+   END
+   GO
+   ```
+
+2. **Create the SQL Agent Job `Alert_TempDB_Shrink`:**
+   ```sql
+   USE [msdb];
+   GO
+
+   IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'Alert_TempDB_Shrink')
+       EXEC msdb.dbo.sp_delete_job @job_name = N'Alert_TempDB_Shrink', @delete_unused_schedule = 1;
+   GO
+
+   EXEC dbo.sp_add_job
+       @job_name    = N'Alert_TempDB_Shrink',
+       @enabled     = 1,
+       @description = N'Detects any reduction in TempDB data or log file size (DBCC SHRINKFILE, AUTO_SHRINK, or restart reset) and sends an HTML/CSS alert.';
+   GO
+
+   EXEC dbo.sp_add_jobstep
+       @job_name      = N'Alert_TempDB_Shrink',
+       @step_name     = N'Compare TempDB File Sizes and Notify on Shrink',
+       @subsystem     = N'TSQL',
+       @database_name = N'msdb',
+       @command       = N'
+   SET NOCOUNT ON;
+   SET QUOTED_IDENTIFIER ON;
+
+   DECLARE @Now            DATETIME2(3) = SYSDATETIME();
+   DECLARE @SqlStartTime   DATETIME2(3) = (SELECT sqlserver_start_time FROM sys.dm_os_sys_info);
+   DECLARE @TracePath      NVARCHAR(260) = (SELECT [path] FROM sys.traces WHERE is_default = 1);
+
+   -- 1. Seed baseline on very first run
+   INSERT INTO msdb.dbo.DBA_TempDB_FileBaseline (FileID, LogicalName, FileType, PhysicalName, LastSizeMB, LastCheckedAt)
+   SELECT
+       df.file_id,
+       df.name,
+       df.type_desc,
+       df.physical_name,
+       CAST(df.size * 8.0 / 1024.0 AS DECIMAL(12,2)),
+       @Now
+   FROM tempdb.sys.database_files df
+   WHERE NOT EXISTS (
+       SELECT 1 FROM msdb.dbo.DBA_TempDB_FileBaseline b WHERE b.FileID = df.file_id
+   );
+
+   -- 2. Detect any TempDB file whose current size is strictly smaller than baseline
+   IF OBJECT_ID(N''tempdb..#ShrunkFiles'') IS NOT NULL DROP TABLE #ShrunkFiles;
+
+   SELECT
+       df.file_id                                                       AS FileID,
+       df.name                                                          AS LogicalName,
+       df.type_desc                                                     AS FileType,
+       df.physical_name                                                 AS PhysicalName,
+       b.LastSizeMB                                                     AS PreviousSizeMB,
+       CAST(df.size * 8.0 / 1024.0 AS DECIMAL(12,2))                    AS CurrentSizeMB,
+       b.LastSizeMB - CAST(df.size * 8.0 / 1024.0 AS DECIMAL(12,2))     AS ShrunkByMB,
+       b.LastCheckedAt                                                  AS BaselineTime
+   INTO #ShrunkFiles
+   FROM tempdb.sys.database_files df
+   JOIN msdb.dbo.DBA_TempDB_FileBaseline b ON df.file_id = b.FileID
+   WHERE CAST(df.size * 8.0 / 1024.0 AS DECIMAL(12,2)) < b.LastSizeMB;
+
+   -- 3. If shrink detected, look up DBCC / Auto-Shrink attribution in Default Trace and email DBA
+   IF EXISTS (SELECT 1 FROM #ShrunkFiles)
+   BEGIN
+       DECLARE @MinBaseline DATETIME2(3) = (SELECT MIN(BaselineTime) FROM #ShrunkFiles);
+       DECLARE @TraceContext NVARCHAR(MAX) = N'''';
+
+       IF @TracePath IS NOT NULL
+       BEGIN
+           SELECT @TraceContext = CAST((
+               SELECT
+                   td = CONVERT(NVARCHAR(23), StartTime, 121),                  N'''',
+                   td = CASE EventClass
+                            WHEN 94  THEN N''AUTO_SHRINK (Data)''
+                            WHEN 95  THEN N''AUTO_SHRINK (Log)''
+                            WHEN 116 THEN N''DBCC Command''
+                        END,                                                    N'''',
+                   td = ISNULL(LoginName, N''-''),                              N'''',
+                   td = ISNULL(SessionLoginName, N''-''),                       N'''',
+                   td = ISNULL(HostName, N''-''),                               N'''',
+                   td = ISNULL(ApplicationName, N''-''),                        N'''',
+                   td = ISNULL(CAST(TextData AS NVARCHAR(400)), N''-'')
+               FROM sys.fn_trace_gettable(@TracePath, DEFAULT)
+               WHERE StartTime >= DATEADD(SECOND, -5, @MinBaseline)
+                 AND (
+                       (EventClass IN (94, 95) AND DatabaseName = N''tempdb'')
+                    OR (EventClass = 116 AND CAST(TextData AS NVARCHAR(MAX)) LIKE N''%SHRINK%'')
+                 )
+               ORDER BY StartTime DESC
+               FOR XML PATH(''tr''), TYPE
+           ) AS NVARCHAR(MAX));
+       END
+
+       DECLARE @RestartNote NVARCHAR(300) = CASE
+           WHEN @SqlStartTime > @MinBaseline
+           THEN N''Note: SQL Server restarted at '' + CONVERT(NVARCHAR(23), @SqlStartTime, 121) + N'' (TempDB resets to initial size on restart).''
+           ELSE N''No instance restart occurred since last check (likely manual DBCC SHRINKFILE / SHRINKDATABASE or AUTO_SHRINK).''
+       END;
+
+       DECLARE @FileRows NVARCHAR(MAX) = CAST((
+           SELECT
+               td = LogicalName,                                N'''',
+               td = FileType,                                   N'''',
+               td = CAST(PreviousSizeMB AS NVARCHAR(20)) + N'' MB'', N'''',
+               td = CAST(CurrentSizeMB AS NVARCHAR(20))  + N'' MB'', N'''',
+               td = N''-'' + CAST(ShrunkByMB AS NVARCHAR(20)) + N'' MB'', N'''',
+               td = PhysicalName
+           FROM #ShrunkFiles
+           ORDER BY FileID
+           FOR XML PATH(''tr''), TYPE
+       ) AS NVARCHAR(MAX));
+
+       DECLARE @Subject NVARCHAR(255) = N''[AUDIT] TempDB File Shrink Detected on '' + @@SERVERNAME;
+       DECLARE @HtmlBody NVARCHAR(MAX) = N''
+       <html>
+       <head>
+           <style>
+               body { font-family: Segoe UI, Arial, sans-serif; color: #1f2937; background-color: #f3f4f6; margin: 0; padding: 20px; }
+               .card { background: #ffffff; border: 1px solid #d1d5db; border-radius: 8px; padding: 20px; max-width: 1100px; }
+               h2 { color: #6d28d9; margin-top: 0; }
+               h3 { color: #374151; margin-top: 18px; margin-bottom: 8px; }
+               .meta { font-size: 13px; color: #4b5563; margin-bottom: 12px; }
+               table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 6px; }
+               th { background-color: #5b21b6; color: #ffffff; text-align: left; padding: 9px 12px; border: 1px solid #4c1d95; }
+               td { padding: 8px 12px; border: 1px solid #e5e7eb; vertical-align: top; }
+               tr:nth-child(even) td { background-color: #f5f3ff; }
+           </style>
+       </head>
+       <body>
+           <div class="card">
+               <h2>TempDB File Shrink Alert</h2>
+               <div class="meta">
+                   <strong>Server:</strong> '' + @@SERVERNAME + N'' &nbsp;|&nbsp;
+                   <strong>Detected At:</strong> '' + CONVERT(NVARCHAR(23), @Now, 121) + N''<br/>
+                   '' + @RestartNote + N''
+               </div>
+               <h3>Shrunk TempDB Files</h3>
+               <table>
+                   <thead>
+                       <tr>
+                           <th>Logical File</th>
+                           <th>Type</th>
+                           <th>Previous Size</th>
+                           <th>Current Size</th>
+                           <th>Shrunk By</th>
+                           <th>Physical Path</th>
+                       </tr>
+                   </thead>
+                   <tbody>'' + ISNULL(@FileRows, N'''') + N''</tbody>
+               </table>'' +
+               CASE WHEN @TraceContext IS NOT NULL AND LEN(@TraceContext) > 0 THEN N''
+               <h3>Default Trace Shrink / DBCC Attribution</h3>
+               <table>
+                   <thead>
+                       <tr>
+                           <th>Timestamp</th>
+                           <th>Event</th>
+                           <th>Effective Login</th>
+                           <th>Original Login</th>
+                           <th>Host</th>
+                           <th>Application</th>
+                           <th>Command</th>
+                       </tr>
+                   </thead>
+                   <tbody>'' + @TraceContext + N''</tbody>
+               </table>'' ELSE N'''' END + N''
+           </div>
+       </body>
+       </html>'';
+
+       EXEC msdb.dbo.sp_send_dbmail
+           @profile_name = N''Papercut_Local_Profile'',
+           @recipients   = N''dba@anywhere.example'',
+           @subject      = @Subject,
+           @body         = @HtmlBody,
+           @body_format  = N''HTML'';
+   END
+
+   -- 4. Update baseline to current sizes for all existing TempDB files
+   UPDATE b
+   SET b.LogicalName   = df.name,
+       b.FileType      = df.type_desc,
+       b.PhysicalName  = df.physical_name,
+       b.LastSizeMB    = CAST(df.size * 8.0 / 1024.0 AS DECIMAL(12,2)),
+       b.LastCheckedAt = @Now
+   FROM msdb.dbo.DBA_TempDB_FileBaseline b
+   JOIN tempdb.sys.database_files df ON b.FileID = df.file_id;
+   ';
+   GO
+
+   EXEC dbo.sp_attach_schedule
+       @job_name      = N'Alert_TempDB_Shrink',
+       @schedule_name = N'Every_1_Minute_TempDB_Watch';
+
+   EXEC dbo.sp_add_jobserver
+       @job_name    = N'Alert_TempDB_Shrink',
+       @server_name = N'(local)';
+   GO
+   ```
+
+#### Testing `Alert_TempDB_Shrink`
+1. **Run once to record the current baseline size** (e.g., `8 MB` or `64 MB`):
+   ```sql
+   EXEC msdb.dbo.sp_start_job @job_name = N'Alert_TempDB_Shrink';
+   WAITFOR DELAY '00:00:03';
+   SELECT * FROM msdb.dbo.DBA_TempDB_FileBaseline;
+   GO
+   ```
+2. **Grow `tempdev` to `128 MB` and update the baseline** (simulating normal workload growth):
+   ```sql
+   ALTER DATABASE [tempdb] MODIFY FILE (NAME = N'tempdev', SIZE = 128MB);
+   GO
+   EXEC msdb.dbo.sp_start_job @job_name = N'Alert_TempDB_Shrink';
+   WAITFOR DELAY '00:00:03';
+   SELECT * FROM msdb.dbo.DBA_TempDB_FileBaseline WHERE LogicalName = N'tempdev';
+   GO
+   ```
+3. **Shrink `tempdev` down to `32 MB` via `DBCC SHRINKFILE` and run `Alert_TempDB_Shrink`:**
+   ```sql
+   USE [tempdb];
+   GO
+   DBCC SHRINKFILE (N'tempdev', 32);
+   GO
+   EXEC msdb.dbo.sp_start_job @job_name = N'Alert_TempDB_Shrink';
+   GO
+   ```
+4. Check **Papercut SMTP**: you will receive `[AUDIT] TempDB File Shrink Detected` displaying `tempdev` shrinking from `128.00 MB` $\rightarrow$ `32.00 MB` (`-96.00 MB`) **plus** the Default Trace row identifying your login, host, SSMS, and `DBCC SHRINKFILE (N'tempdev', 32)`!
+
+---
+
+## Part 12: `AdventureWorks2022` Space Monitoring & `sys.sp_spaceused`
+
+### Step 12.1 — Conditionally Restore `AdventureWorks2022` If It Doesn't Exist
+**Task:** *Restore database `AdventureWorks2022` if it doesn't exist. (This is not the light version... `LT2022`.)*
+
+#### How to do it
+Uses `C:\Exo\Database\AdventureWorks2022.bak` (from Part 1) and checks `DB_ID(N'AdventureWorks2022')` first so the script is completely safe and idempotent:
+
+```sql
+USE [master];
+GO
+
+IF DB_ID(N'AdventureWorks2022') IS NULL
+BEGIN
+    PRINT N'AdventureWorks2022 not found. Restoring from C:\Exo\Database\AdventureWorks2022.bak...';
+
+    RESTORE DATABASE [AdventureWorks2022]
+    FROM DISK = N'C:\Exo\Database\AdventureWorks2022.bak'
+    WITH MOVE N'AdventureWorks2022'     TO N'C:\Exo\Database\AdventureWorks2022.mdf',
+         MOVE N'AdventureWorks2022_log' TO N'C:\Exo\Database\AdventureWorks2022_log.ldf',
+         RECOVERY, STATS = 10;
+END
+ELSE
+BEGIN
+    PRINT N'Database [AdventureWorks2022] already exists (state: ' +
+          CAST(DATABASEPROPERTYEX(N'AdventureWorks2022', 'Status') AS NVARCHAR(50)) + N'). Skipping restore.';
+END
+GO
+```
+
+*(If `C:\Exo\Database\AdventureWorks2022.bak` was deleted, re-download it first: `https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks/AdventureWorks2022.bak`.)*
+
+---
+
+### Step 12.2 — Query Used Space and Free Space (2 Rows: Data vs. Transaction Log)
+**Task:**
+1. *Create a query that lists database used space and free space in `AdventureWorks2022`.*
+2. *Adjust your query so output is two rows: one for data files and one for the transaction log file.*
+3. *Why is it important to monitor used and free space in a production database?*
+
+#### How to do it
+**Step A — Per-File Breakdown (`sys.database_files` + `FILEPROPERTY`):**
+```sql
+USE [AdventureWorks2022];
+GO
+
+SELECT
+    df.file_id,
+    df.name AS LogicalName,
+    df.type_desc AS FileType,
+    CAST(df.size * 8.0 / 1024.0 AS DECIMAL(12, 2)) AS AllocatedSpaceMB,
+    CAST(FILEPROPERTY(df.name, 'SpaceUsed') * 8.0 / 1024.0 AS DECIMAL(12, 2)) AS UsedSpaceMB,
+    CAST((df.size - FILEPROPERTY(df.name, 'SpaceUsed')) * 8.0 / 1024.0 AS DECIMAL(12, 2)) AS FreeSpaceMB,
+    CAST(FILEPROPERTY(df.name, 'SpaceUsed') * 100.0 / NULLIF(df.size, 0) AS DECIMAL(5, 2)) AS UsedPct
+FROM sys.database_files df
+ORDER BY df.file_id;
+GO
+```
+
+**Step B — Adjusted Query Returning Exactly Two Rows (One for Data Files, One for Transaction Log File):**
+```sql
+USE [AdventureWorks2022];
+GO
+
+SELECT
+    CASE df.[type]
+        WHEN 0 THEN N'Data Files'
+        WHEN 1 THEN N'Transaction Log'
+        ELSE df.type_desc
+    END AS FileCategory,
+    COUNT(*) AS FileCount,
+    CAST(SUM(CAST(df.size AS BIGINT)) * 8.0 / 1024.0 AS DECIMAL(12, 2)) AS TotalAllocatedMB,
+    CAST(SUM(CAST(FILEPROPERTY(df.name, 'SpaceUsed') AS BIGINT)) * 8.0 / 1024.0 AS DECIMAL(12, 2)) AS UsedSpaceMB,
+    CAST(SUM(CAST(df.size - FILEPROPERTY(df.name, 'SpaceUsed') AS BIGINT)) * 8.0 / 1024.0 AS DECIMAL(12, 2)) AS FreeSpaceMB,
+    CAST(
+        SUM(CAST(FILEPROPERTY(df.name, 'SpaceUsed') AS BIGINT)) * 100.0
+        / NULLIF(SUM(CAST(df.size AS BIGINT)), 0)
+        AS DECIMAL(5, 2)
+    ) AS UsedPct,
+    CAST(
+        SUM(CAST(df.size - FILEPROPERTY(df.name, 'SpaceUsed') AS BIGINT)) * 100.0
+        / NULLIF(SUM(CAST(df.size AS BIGINT)), 0)
+        AS DECIMAL(5, 2)
+    ) AS FreePct
+FROM sys.database_files df
+WHERE df.[type] IN (0, 1)
+GROUP BY
+    CASE df.[type]
+        WHEN 0 THEN N'Data Files'
+        WHEN 1 THEN N'Transaction Log'
+        ELSE df.type_desc
+    END
+ORDER BY FileCategory ASC; -- 'Data Files' row 1, 'Transaction Log' row 2
+GO
+```
+
+#### Key Learning & Intentional Trap
+- **Trap (`FILEPROPERTY` Database Context):** `FILEPROPERTY(name, 'SpaceUsed')` always evaluates against the **current `USE [...]` database context**—never the database prefix on `sys.database_files`! If your query window is in `master` and you select from `AdventureWorks2022.sys.database_files`, `FILEPROPERTY` looks up `AdventureWorks2022`'s logical filename inside `master` and returns **`NULL`**. Always execute `USE [AdventureWorks2022];` first (or use dynamic SQL / `sp_executesql` inside `AdventureWorks2022`).
+
+#### Why Is It Important to Monitor Used and Free Space in a Production Database?
+1. **Prevent Sudden Out-of-Space Outages (`Error 1105` / `Error 9002`):** If data or log files hit disk capacity or `MAXSIZE` with 0% free space, inserts, updates, and deletes fail immediately and the application goes down.
+2. **Avoid Autogrowth Stalls & VLF Fragmentation:** Frequent unplanned autogrowth pauses transactions while the OS allocates and zero-initializes space (especially for `.ldf` log files, which cannot use Instant File Initialization and accumulate excessive **VLFs** that slow down backups and crash recovery).
+3. **Catch Runaway Transaction Logs Early:** Rising `UsedSpaceMB` inside the transaction log warns you immediately of a failed log backup job, a forgotten open transaction (`DBCC OPENTRAN`), or replication/AlwaysOn `log_reuse_wait_desc` delays.
+4. **Capacity Planning & Maintenance Window Sizing:** Tracking free space ensures enough headroom exists for online index rebuilds, `DBCC CHECKDB`, and predictable SAN/disk expansion before emergencies.
+
+---
+
+### Step 12.3 — Run `EXECUTE AdventureWorks2022.sys.sp_spaceused;` & Compare the Two Methods
+**Task:**
+1. *Run `EXECUTE AdventureWorks2022.sys.sp_spaceused;`*
+2. *Explain if there are any differences between the two methods.*
+
+#### How to do it
+```sql
+EXECUTE AdventureWorks2022.sys.sp_spaceused;
+GO
+```
+*(Optional: pass `@updateusage = N'TRUE'` if you want SQL Server to run `DBCC UPDATEUSAGE` first to refresh any out-of-sync page counts.)*
+
+#### Differences Between `sys.database_files` + `FILEPROPERTY` vs. `sys.sp_spaceused`
+
+| Comparison Aspect | `sys.database_files` + `FILEPROPERTY(..., 'SpaceUsed')` (2-Row Query) | `EXECUTE AdventureWorks2022.sys.sp_spaceused` |
+| :--- | :--- | :--- |
+| **Data vs. Transaction Log Separation** | **Explicitly separates Data files (Row 1) and Transaction Log file (Row 2)**—showing exact used vs. free MB for *both* `.mdf`/`.ndf` and `.ldf`. | **Does NOT separate or report transaction log free/used space!** Result Set 1 combines Data + Log allocated size into `database_size`, while `unallocated space` and Result Set 2 measure **Data files only**. |
+| **Output Structure & Automation** | Returns **1 relational result set** with numeric `DECIMAL` MB and `%` columns—ready for `INSERT INTO` monitoring tables, alerts, and dashboards. | Returns **2 separate result sets** with formatted string units (e.g., `'208.00 MB'`, `'194368 KB'`), making programmatic alerting or `INSERT ... EXEC` awkward. |
+| **Object-Level Breakdown** | Shows file-level allocated vs. space used by extents—does **not** split data pages vs. index pages vs. reserved-but-unused pages. | Result Set 2 breaks data-file usage down into **`reserved`**, **`data`**, **`index_size`**, and **`unused`** (pages reserved inside extents for tables/indexes that don't yet hold rows). |
+| **How "Free Space" Is Calculated** | `size - FILEPROPERTY(name, 'SpaceUsed')` = **unallocated extent space** inside each file (data and log separately). | `unallocated space` = unallocated extent space in **data files only** (excluding `unused` pages already reserved inside object extents, and excluding log space). |
+| **Context & Freshness** | Requires `USE [AdventureWorks2022]` context because of `FILEPROPERTY`; reads live file allocation bitmaps directly. | Can be called remotely from any database (`EXECUTE AdventureWorks2022.sys.sp_spaceused;`); Result Set 2 relies on `sys.allocation_units`/`sys.partitions` metadata (occasionally needs `@updateusage = N'TRUE'` after heavy DDL). |
+
+
